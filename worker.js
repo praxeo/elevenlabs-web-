@@ -657,9 +657,9 @@ const INDEX_HTML = `<!doctype html>
     }
     #bigTopRow { width: 100%; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
     #bigJoinedBadge { font-family: monospace; letter-spacing: 2px; color: var(--accent); font-size: 14px; flex: 1 1 auto; }
-    #bigMicPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
-    #bigMicPill.ok { color: var(--muted); }
-    #bigMicPill.bad { color: var(--danger); font-weight: 600; }
+    #bigMicPill, #bigDesktopPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+    #bigMicPill.ok, #bigDesktopPill.ok { color: var(--muted); }
+    #bigMicPill.bad, #bigDesktopPill.bad { color: var(--danger); font-weight: 600; }
     /* Undelivered-notes chips (phone delivery queue) — tappable, warn-toned. */
     #queueChip, #bigQueueChip {
       color: var(--warn); border: 1px solid var(--warn); border-radius: 10px;
@@ -1020,6 +1020,7 @@ right lower quadrant"></textarea>
     <div id="bigTopRow">
       <span id="bigJoinedBadge"></span>
       <span id="bigMicPill" style="display:none"></span>
+      <span id="bigDesktopPill" style="display:none"></span>
       <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
       <button id="bigLeaveBtn">Leave</button>
       <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
@@ -1214,6 +1215,7 @@ right lower quadrant"></textarea>
   const bigStatusEl      = document.getElementById("bigStatus");
   const bigJoinedBadgeEl = document.getElementById("bigJoinedBadge");
   const bigMicPillEl     = document.getElementById("bigMicPill");
+  const bigDesktopPillEl = document.getElementById("bigDesktopPill");
   const bigLeaveBtnEl    = document.getElementById("bigLeaveBtn");
   const bigSettingsBtnEl = document.getElementById("bigSettingsBtn");
   const bigReturnBtnEl   = document.getElementById("bigReturnBtn");
@@ -1309,6 +1311,8 @@ right lower quadrant"></textarea>
   let phoneReconnectTimer = null; // desktop: pending reconnect attempt
   let phoneReconnectDelayMs = 0;  // desktop: current reconnect backoff
   let phoneFallbackTimer = null;  // desktop: grace timer before live-text fallback delivery
+  let phonePollTimer    = null; // desktop: /latest poll-fallback interval (fires only while the WS is not OPEN)
+  let statusPollTimer   = null; // phone: /status presence-poll interval (big-button surface only)
   let lastDeliveryId    = "";   // desktop: most recent phone_delivery id (migrated into recentDeliveryIds)
   let recentDeliveryIds = [];   // desktop: ring of recent ids — dedupes BOTH room replays and retried/out-of-order re-POSTs
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
@@ -1459,6 +1463,8 @@ right lower quadrant"></textarea>
   const PHONE_RECONNECT_MAX_MS  = 15000; // reconnect backoff cap
   const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
   const RELAY_TIMEOUT_MS        = 10000; // phone->room delivery ack deadline; a hung relay must fail loudly, and the queued next session waits on the ack
+  const POLL_LATEST_MS          = 10000; // desktop /latest poll-fallback cadence while the listener WS is not OPEN (hidden tabs are browser-throttled to ~1/min — still lands a note within a minute instead of never)
+  const STATUS_POLL_MS          = 25000; // phone: desktop-presence /status poll cadence for the big-screen pill (a cue, never a gate)
 
   // Phone-side durable delivery queue: an undelivered relay (POST failed, or a
   // zero-listener ack means the desktop was down past the room's 2-min replay
@@ -4101,6 +4107,9 @@ right lower quadrant"></textarea>
     connectPhoneSessionWs();
     phoneLastPongAt = Date.now();
     if (!phonePingTimer) phonePingTimer = setInterval(phoneHeartbeat, PHONE_PING_INTERVAL_MS);
+    // Poll fallback: a no-op every tick the WS is OPEN; the safety net when it
+    // is not (see pollLatestDeliveries).
+    if (!phonePollTimer) phonePollTimer = setInterval(function () { pollLatestDeliveries(false); }, POLL_LATEST_MS);
     setStatus(statusMsg, "ok");
   }
 
@@ -4191,6 +4200,36 @@ right lower quadrant"></textarea>
     }, phoneReconnectDelayMs);
   }
 
+  // Desktop-presence pill (phone, big-button surface). The phone holds no
+  // socket, so before this it learned the desktop was gone only AFTER a
+  // dictation came back with a zero-listener ack — the note already queued.
+  // Poll the room's /status while visible on the big screen so the clinician
+  // can SEE "desktop not listening" BEFORE speaking. A cue only — it never
+  // gates recording (the queue + manual send catch an offline desktop), and it
+  // hides on any fetch failure or an old worker's 404 so it cannot mislead.
+  async function pollDesktopStatus() {
+    if (!joinedSessionCode || !bigButtonActive()) { setDesktopPill(null); return; }
+    if (document.visibilityState !== "visible") return;
+    try {
+      var res = await fetch("/api/session/" + joinedSessionCode + "/status");
+      if (!res.ok) { setDesktopPill(null); return; }
+      var data = JSON.parse(await res.text());
+      if (!data || typeof data.listeners !== "number") { setDesktopPill(null); return; }
+      setDesktopPill(data.listeners > 0);
+      // Presence detected while notes wait: deliver NOW instead of riding out
+      // the retry backoff — the "desktop just came back" heal.
+      if (data.listeners > 0 && deliveryQueue.length) backgroundFlush();
+    } catch (e) { setDesktopPill(null); }
+  }
+
+  function setDesktopPill(state) {
+    if (!bigDesktopPillEl) return;
+    if (state === null || !joinedSessionCode || !bigButtonActive()) { bigDesktopPillEl.style.display = "none"; return; }
+    bigDesktopPillEl.style.display = "";
+    if (state) { bigDesktopPillEl.textContent = "🖥 Desktop ✓"; bigDesktopPillEl.className = "ok"; }
+    else { bigDesktopPillEl.textContent = "🖥 Desktop not listening"; bigDesktopPillEl.className = "bad"; }
+  }
+
   // Desktop returning to the foreground: the listener socket commonly dies while
   // the tab is backgrounded (browsers freeze background tabs and throttle the
   // heartbeat timer; NAT idle-timeouts kill the socket without firing onclose),
@@ -4211,9 +4250,38 @@ right lower quadrant"></textarea>
     if (!phoneSessionWs) connectPhoneSessionWs();
   }
 
+  // /latest poll fallback (desktop). The WS is the primary delivery path, but
+  // it can be dead while a note waits at the room: background tabs are frozen
+  // (heartbeat + backoff timers throttled) and NAT idle-timeouts kill sockets
+  // without firing onclose. While the socket is not OPEN, sweep the room's
+  // fresh deliveries through the NORMAL message handler — the persisted
+  // delivery_id ring dedupes and this desktop's append ownership applies, so a
+  // poll delivery is indistinguishable from a WS one. Even hidden-tab timer
+  // throttling (~1 tick/min) lands the note within a minute instead of never.
+  // force=true (the foreground sweep) also checks past an OPEN-looking socket:
+  // a zombie can read OPEN for up to PHONE_PONG_TIMEOUT_MS — the sweep is
+  // dedupe-safe, so checking is free. Fully best-effort: the WS reconnect
+  // machinery stays the loud path.
+  async function pollLatestDeliveries(force) {
+    if (!phoneSessionCode) return;
+    if (!force && phoneSessionWs && phoneSessionWs.readyState === 1) return;
+    try {
+      var res = await fetch("/api/session/" + phoneSessionCode + "/latest");
+      if (!res.ok) return;
+      var data = JSON.parse(await res.text());
+      // New workers return the full fresh ring; an old worker only the newest.
+      var list = Array.isArray(data.deliveries) ? data.deliveries : (data.delivery ? [data.delivery] : []);
+      for (var i = 0; i < list.length; i++) {
+        var d = list[i];
+        if (d && d.message_type === "phone_delivery") handlePhoneSessionMessage(d);
+      }
+    } catch (e) {}
+  }
+
   function stopPhoneSession() {
     phoneSessionCode = ""; // cleared first so the onclose below does not reconnect
     if (phonePingTimer)      { clearInterval(phonePingTimer); phonePingTimer = null; }
+    if (phonePollTimer)      { clearInterval(phonePollTimer); phonePollTimer = null; }
     if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
     if (phoneFallbackTimer)  { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
     if (phoneSessionWs) {
@@ -4673,6 +4741,15 @@ right lower quadrant"></textarea>
     // the between-takes iOS corpse); off it, clear the timer + pill.
     if (active && !micIdleTimer) micIdleTimer = setInterval(micIdleSample, MIC_IDLE_PROBE_MS);
     if (!active && micIdleTimer) { clearInterval(micIdleTimer); micIdleTimer = null; micIdleDeadFrames = 0; setBigMicPill(""); }
+    // Desktop-presence polling: joined big-button surface only; immediate first
+    // poll so the pill is honest the moment the layout appears.
+    if (active && joinedSessionCode && !statusPollTimer) {
+      statusPollTimer = setInterval(pollDesktopStatus, STATUS_POLL_MS);
+      pollDesktopStatus();
+    }
+    if ((!active || !joinedSessionCode) && statusPollTimer) {
+      clearInterval(statusPollTimer); statusPollTimer = null; setDesktopPill(null);
+    }
     if (!active) {
       document.body.classList.remove("bigbtn-settings");
       bigPeekExpanded = false;
@@ -5289,6 +5366,8 @@ right lower quadrant"></textarea>
     }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
     reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden, so deliveries land
+    pollLatestDeliveries(true); // desktop: sweep the room NOW — a zombie socket can look OPEN for up to the pong timeout; the sweep is dedupe-safe
+    pollDesktopStatus(); // phone: refresh the desktop-presence pill the moment the surface is looked at
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
@@ -5301,6 +5380,8 @@ right lower quadrant"></textarea>
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
     reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden
+    pollLatestDeliveries(true); // desktop: dedupe-safe sweep past a possibly-zombie socket
+    pollDesktopStatus(); // phone: refresh the presence pill on app-switch return
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });

@@ -46,6 +46,14 @@
 //      + idle only) pushes existing text through the normal queue+cue path with
 //      a fresh delivery_id; the queue chip surfaces undelivered notes and a tap
 //      retries; everything hides when unjoined
+//  35. desktop /latest poll fallback: a foreground sweep (and a timer while the
+//      WS is down) lands the room's fresh deliveries through the normal handler
+//      exactly once (ring-deduped); the old-worker single-delivery shape still
+//      lands; ending the session stops the polls
+//  36. desktop-presence pill: the joined phone polls /status — listeners>0
+//      shows "Desktop ✓" (and flushes queued notes immediately), zero shows
+//      "not listening" BEFORE dictating, a 404 (old worker) hides the pill,
+//      Leave tears it down
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
 //      persisted delivery RING (cap 5, oldest dropped) replayed inside the
 //      retention window only, transcripts not buffered, GET /latest for native
@@ -3159,6 +3167,157 @@ console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
   doc34.getElementById('phoneLeaveBtn').click();
   await sleep(30);
   check('s34f: the send button hides when not joined', sendBtn.style.display === 'none', sendBtn.style.display);
+}
+
+// ===== Scenario 35: desktop /latest poll fallback =====
+// The WS is the primary path, but it dies silently behind Cerner/Citrix
+// (frozen tabs, NAT kills without onclose). The desktop now sweeps the room's
+// fresh deliveries over GET /latest — through the NORMAL message handler, so
+// the dedupe ring and append ownership apply — on foreground and on a timer
+// while the socket is not OPEN. An old worker's single-delivery shape still
+// lands via the fallback.
+console.log('--- scenario 35: desktop /latest poll fallback ---');
+{
+  const fetch35 = [];
+  let latestBody35 = null; // what GET /latest answers
+  let w35;
+  const dom35 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w35 = win;
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url) => {
+        fetch35.push(String(url));
+        if (String(url).includes('/latest')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(latestBody35 || { ok: true, delivery: null, deliveries: [] })) });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // A persisted desktop session: boot resumes the room (WS stays CONNECTING
+      // in the mock — exactly the dead-link regime the poll fallback covers).
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ phoneSessionCode: 'POLL01' }));
+    },
+  });
+  await sleep(150);
+  const doc35 = dom35.window.document;
+  const vis35 = () => { dom35.window.document.dispatchEvent(new dom35.window.Event('visibilitychange')); };
+
+  // (a) Two deliveries wait at the room; the foreground sweep lands BOTH in
+  //     order through the normal handler (newest ends up on the clipboard).
+  latestBody35 = {
+    ok: true,
+    age_ms: 5,
+    delivery: { message_type: 'phone_delivery', text: 'Poll two.', delivery_id: 'p2' },
+    deliveries: [
+      { message_type: 'phone_delivery', text: 'Poll one.', delivery_id: 'p1' },
+      { message_type: 'phone_delivery', text: 'Poll two.', delivery_id: 'p2' },
+    ],
+  };
+  vis35();
+  await sleep(120);
+  check('s35a: the foreground sweep GETs /latest', fetch35.some((u) => u.includes('/api/session/POLL01/latest')), fetch35.join(','));
+  check('s35a: the newest swept delivery reaches the clipboard', (w35._clip || '').includes('Poll two.'), JSON.stringify(w35._clip));
+
+  // (b) Re-sweeping the same ring is deduped by the persisted id ring.
+  w35._clip = 'SWEPT';
+  vis35();
+  await sleep(120);
+  check('s35b: a repeat sweep is deduped (no re-copy)', w35._clip === 'SWEPT', JSON.stringify(w35._clip));
+
+  // (c) Old-worker shape: no deliveries[] — the single delivery still lands.
+  latestBody35 = { ok: true, age_ms: 5, delivery: { message_type: 'phone_delivery', text: 'Old worker note.', delivery_id: 'p3' } };
+  vis35();
+  await sleep(120);
+  check('s35c: an old worker single-delivery shape still lands', (w35._clip || '').includes('Old worker note.'), JSON.stringify(w35._clip));
+
+  // (d) End session: the poll timer is torn down with the rest of the link.
+  doc35.getElementById('phoneStopBtn').click();
+  await sleep(30);
+  const polls0 = fetch35.filter((u) => u.includes('/latest')).length;
+  vis35();
+  await sleep(120);
+  check('s35d: no sweeps after the session ends', fetch35.filter((u) => u.includes('/latest')).length === polls0, fetch35.filter((u) => u.includes('/latest')).length - polls0 + ' extra');
+}
+
+// ===== Scenario 36: desktop-presence pill (phone) =====
+// The phone used to learn the desktop was gone only AFTER a dictation's
+// zero-listener ack. The big screen now polls GET /status and shows
+// "Desktop ✓ / not listening" BEFORE the clinician speaks — a cue, never a
+// gate; hidden on any failure/404 (old worker) so it can never mislead. A
+// positive poll with queued notes flushes them immediately.
+console.log('--- scenario 36: desktop-presence pill (phone /status poll) ---');
+{
+  const fetch36 = [];
+  let status36 = { ok: true, listeners: 1, buffered: 0 }; // /status answer (null => 404)
+  let deliver36 = 'fail';
+  const dom36 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url) => {
+        fetch36.push(String(url));
+        if (String(url).includes('/status')) {
+          if (!status36) return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('Not found') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(status36)) });
+        }
+        if (String(url).includes('/deliver')) {
+          if (deliver36 === 'fail') return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('boom') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // A joined phone with one stranded note bound to this code: the flush-on-
+      // presence leg proves a positive /status delivers it immediately.
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({
+        joinedSessionCode: 'STAT01', micGranted: true,
+        pendingDeliveries: [{ id: 'stat-1', text: 'Stranded note.', ts: Date.now(), code: 'STAT01' }],
+      }));
+    },
+  });
+  await sleep(200); // boot: join restores -> big surface -> immediate /status poll (+ the boot flush fails, keeping the note queued)
+  const doc36 = dom36.window.document;
+  const pill36 = doc36.getElementById('bigDesktopPill');
+  check('s36: the boot poll hits /status', fetch36.some((u) => u.includes('/api/session/STAT01/status')), fetch36.join(',').slice(0, 200));
+  check('s36: listeners>0 shows Desktop ✓', pill36.style.display !== 'none' && pill36.textContent.includes('Desktop ✓'), pill36.textContent);
+
+  // Presence + queued note => immediate flush (no backoff wait).
+  deliver36 = 'ok';
+  dom36.window.dispatchEvent(new dom36.window.Event('focus')); // focus re-polls status (and flushes on presence)
+  await sleep(250);
+  const q36 = JSON.parse(dom36.window.localStorage.getItem('scribe_v2_settings_v9')).pendingDeliveries || [];
+  check('s36: presence + queued note flushes immediately', q36.length === 0, JSON.stringify(q36));
+
+  // Zero listeners => the pill warns BEFORE dictating.
+  status36 = { ok: true, listeners: 0, buffered: 0 };
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: zero listeners shows "not listening"', pill36.textContent.includes('not listening') && pill36.className.includes('bad'), pill36.textContent + '/' + pill36.className);
+
+  // Old worker (404) => the pill hides rather than mislead.
+  status36 = null;
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: a 404 /status hides the pill (old worker)', pill36.style.display === 'none', pill36.style.display);
+
+  // Leave tears the pill down with the join.
+  status36 = { ok: true, listeners: 1, buffered: 0 };
+  doc36.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  check('s36: Leave hides the presence pill', pill36.style.display === 'none', pill36.style.display);
 }
 
 // ===== Scenario 25w: joined + degraded outcome — the relay ack must WARN, never doneBeep =====
