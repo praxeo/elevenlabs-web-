@@ -35,12 +35,31 @@
 //      falls back to live text (cancelled by the real delivery), and the
 //      phone treats a zero-listener deliver ack as a loud failure
 //  20q. phone-side durable delivery queue: a failed/zero-listener /deliver
-//      enqueues the text (persisted), an online/boot heal re-POSTs it with the
-//      SAME id until a listener acks (then the queue clears), and the desktop
-//      ring-dedupe drops a stale re-POST arriving after a newer delivery
+//      enqueues the text (persisted + CODE-BOUND), an online/boot heal re-POSTs
+//      it with the SAME id until a listener acks (then the queue clears), the
+//      desktop ring-dedupe drops a stale re-POST arriving after a newer
+//      delivery, Leave KEEPS the queue (rejoining the same code auto-delivers —
+//      the stranded-note incident self-heals), a different-code join keeps the
+//      item but never POSTs it there, and a legacy no-code item is stamped with
+//      the persisted join at boot
+//  34. manual "Send to desktop" (box / history rows / expanded big-peek, joined
+//      + idle only) pushes existing text through the normal queue+cue path with
+//      a fresh delivery_id; the queue chip surfaces undelivered notes and a tap
+//      retries; everything hides when unjoined
+//  35. desktop /latest poll fallback: a foreground sweep (and a timer while the
+//      WS is down) lands the room's fresh deliveries through the normal handler
+//      exactly once (ring-deduped); the old-worker single-delivery shape still
+//      lands; ending the session stops the polls
+//  36. desktop-presence pill: the joined phone polls /status — listeners>0
+//      shows "Desktop ✓" (and flushes queued notes immediately), zero shows
+//      "not listening" BEFORE dictating, a 404 (old worker) hides the pill,
+//      Leave tears it down
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
-//      held-delivery replay inside the window only, transcripts not buffered,
-//      GET /latest for native pollers (fresh delivery vs stale null)
+//      persisted delivery RING (cap 5, oldest dropped) replayed inside the
+//      retention window only, transcripts not buffered, GET /latest for native
+//      pollers (back-compat delivery + additive deliveries[]), GET /status
+//      (listeners + buffered cue), eviction survival via DO storage, and the
+//      cleanup alarm pruning expired text from storage
 //  22. phone link persistence: desktop session + phone join survive reloads
 //      (resume room at boot, replay deduped by the persisted delivery id,
 //      Leave/End forget the stored codes)
@@ -75,6 +94,25 @@
 //      two-speaker words[] drops the bystander with a no-beep "removed N words"
 //      status note, a single speaker is a no-op, and toggling off sends
 //      diarize=false + skips client filtering + persists per-device
+//  25w. joined + degraded outcome: a large speaker-filter cut delivered over the
+//      relay gets warnBeep + VERIFY on the delivered ack — never doneBeep
+//  23p. phone corpse-mic probe (every press): a dead analyser read forces ONE
+//      pre-capture rebuild and a still-dead mic fails LOUD before capture (no
+//      REC, no upload, sentinel); a healthy mic exits on frame 0 (no rebuild)
+//  37. fresh-graph silent capture (the VPIO wall): a FRESH getUserMedia stream
+//      that delivers silence gets one rebuild then a loud pre-capture failure
+//  38. idle mic-health sampler: two consecutive dead idle frames proactively
+//      rebuild the retained graph (never mid-recording) + the Mic ✓/⚠ pill
+//  39. transcript-coverage guard: a result whose last word ends far short of the
+//      speech the gate observed (or whose decoded audio is far shorter than the
+//      recording) is a degraded WARN (text still delivered + diag ring entry),
+//      a full-coverage take stays a clean Done!, words without timestamps and
+//      absent duration are clean no-ops, and the gate-open baseline kills the
+//      held-but-silent false warn
+//  40. duration-aware upload deadline: a long take's transcription outlives the
+//      old flat 15 s deadline and still succeeds
+//  41. journal cap honesty: a recovery capped at JOURNAL_MAX_CHUNKS says only
+//      the first ~N minutes were saved; an uncapped one doesn't
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -1081,15 +1119,42 @@ console.log('--- scenario 20q: phone delivery queue ---');
   check('s20q: a delivered item clears the queue', queue20q().length === 0, JSON.stringify(queue20q()));
   check('s20q: a drained queue gives quiet positive closure', status20q().includes('delivered to the desktop'), status20q());
 
-  // Leaving the session abandons any queued deliveries (text stays in history).
+  // Leave KEEPS the queued deliveries (code-bound) — the old wipe here
+  // destroyed the undelivered note a clinician was trying to recover, because
+  // re-linking passes through Leave. The user's field incident.
   deliverMode = 'fail';
   doc20q.getElementById('recordBtn').click();
   await sleep(80);
   doc20q.getElementById('recordBtn').click();
   await sleep(600);
   check('s20q: a second failure re-queues', queue20q().length === 1, JSON.stringify(queue20q()));
+  check('s20q: the queued item is code-bound', queue20q()[0] && queue20q()[0].code === 'QUE111', JSON.stringify(queue20q()[0]));
   doc20q.getElementById('phoneLeaveBtn').click();
-  check('s20q: Leave clears the delivery queue', queue20q().length === 0, JSON.stringify(queue20q()));
+  await sleep(30);
+  check('s20q: Leave KEEPS the code-bound queue (text no longer destroyed)', queue20q().length === 1, JSON.stringify(queue20q()));
+  check('s20q: Leave says the undelivered note is kept', status20q().includes('undelivered note') && status20q().includes('kept'), status20q());
+  check('s20q: the queue chip shows the stranded note while unjoined', doc20q.getElementById('queueChip').style.display !== 'none' && doc20q.getElementById('queueChip').textContent.includes('another desktop'), doc20q.getElementById('queueChip').textContent);
+
+  // Joining a DIFFERENT desktop: the item is kept but NEVER auto-POSTed to the
+  // wrong code (stale text must not land on the wrong chart).
+  deliverMode = 'ok';
+  const deliverCount1 = deliveries20q().length;
+  doc20q.getElementById('phoneJoinInput').value = 'OTHER9';
+  doc20q.getElementById('phoneJoinBtn').click();
+  await sleep(300);
+  const wrongCodePosts = deliveries20q().slice(deliverCount1).filter((c) => c.url.includes('/api/session/OTHER9/'));
+  check('s20q: a different-code join never POSTs the old-code item', wrongCodePosts.length === 0, wrongCodePosts.map((c) => c.url).join(','));
+  check('s20q: the item survives the different-code join', queue20q().length === 1 && queue20q()[0].code === 'QUE111', JSON.stringify(queue20q()));
+
+  // REJOINING the original code auto-flushes it — the incident self-heals.
+  doc20q.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  doc20q.getElementById('phoneJoinInput').value = 'QUE111';
+  doc20q.getElementById('phoneJoinBtn').click();
+  await sleep(300);
+  const rejoinPosts = deliveries20q().filter((c) => c.url.includes('/api/session/QUE111/'));
+  check('s20q: rejoining the SAME code auto-delivers the stranded note', queue20q().length === 0 && rejoinPosts.length > deliverCount1 - 1, JSON.stringify(queue20q()));
+  check('s20q: the queue chip clears once delivered', doc20q.getElementById('queueChip').style.display === 'none', doc20q.getElementById('queueChip').style.display);
 }
 
 {
@@ -1114,7 +1179,9 @@ console.log('--- scenario 20q: phone delivery queue ---');
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
       // Seed a persisted join + an undelivered queued delivery: a phone that
-      // died after transcribing but before its relay landed.
+      // died after transcribing but before its relay landed. The item has NO
+      // code field (a legacy pre-code-binding queue) — loadSettings must stamp
+      // it with the persisted join so it still flushes after the update.
       win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({
         saveApiKey: true,
         joinedSessionCode: 'BOOT22',
@@ -1199,9 +1266,23 @@ console.log('--- scenario 21: session room DO contract ---');
     async text() { return this.body; }
   };
 
-  const room = new worker.SessionRoom({}, {});
+  // Fake DO storage over a shared Map: a SECOND SessionRoom instance over the
+  // same map simulates room eviction + rehydration, and the alarm prune can be
+  // asserted. put() deep-copies so in-memory ts pokes can't alias the "disk".
+  const mem = new Map();
+  let alarmAt = null;
+  const fakeState = () => ({ storage: {
+    get: async (k) => mem.get(k),
+    put: async (k, v) => { mem.set(k, JSON.parse(JSON.stringify(v))); },
+    delete: async (k) => { mem.delete(k); },
+    setAlarm: async (t) => { alarmAt = t; },
+    deleteAlarm: async () => { alarmAt = null; },
+  } });
+
+  const room = new worker.SessionRoom(fakeState(), {});
   const wsReq = () => ({ headers: { get: (h) => (h === 'Upgrade' ? 'websocket' : null) }, method: 'GET', url: 'https://room/api/session/ABC123' });
   const postReq = (body) => ({ headers: { get: () => null }, method: 'POST', url: 'https://room/broadcast', text: async () => body });
+  const isDeliveryFrame = (d) => { try { return JSON.parse(d).message_type === 'phone_delivery'; } catch (e) { return false; } };
 
   await room.fetch(wsReq());
   const listenerA = lastPair.server;
@@ -1221,22 +1302,55 @@ console.log('--- scenario 21: session room DO contract ---');
   const listenerB = lastPair.server;
   check('s21: reconnecting listener gets the held delivery replayed', listenerB.sent.includes(delivery), listenerB.sent.length + ' frames');
 
-  room.lastDelivery.ts -= 3 * 60 * 1000; // age it past the replay window
+  room.deliveries.forEach((d) => { d.ts -= 31 * 60 * 1000; }); // age past the retention window (in memory)
   await room.fetch(wsReq());
   const listenerC = lastPair.server;
   check('s21: stale deliveries are not replayed', !listenerC.sent.includes(delivery), listenerC.sent.length + ' frames');
 
   const ackNonDelivery = JSON.parse(await (await room.fetch(postReq(JSON.stringify({ message_type: 'partial_transcript', text: 'x' })))).text());
-  check('s21: transcript frames are not buffered as deliveries', room.lastDelivery.body === delivery && typeof ackNonDelivery.listeners === 'number');
+  check('s21: transcript frames are not buffered as deliveries', room.deliveries.length && room.deliveries[room.deliveries.length - 1].body === delivery && typeof ackNonDelivery.listeners === 'number');
 
   // GET /latest: native pollers (AHK) read the held delivery without joining
   const latestReq = () => ({ headers: { get: () => null }, method: 'GET', url: 'https://room/api/session/ABC123/latest' });
   const staleLatest = JSON.parse(await (await room.fetch(latestReq())).text());
-  check('s21: /latest returns null for a stale delivery', staleLatest.ok === true && staleLatest.delivery === null, JSON.stringify(staleLatest));
+  check('s21: /latest returns null for a stale delivery', staleLatest.ok === true && staleLatest.delivery === null && Array.isArray(staleLatest.deliveries) && staleLatest.deliveries.length === 0, JSON.stringify(staleLatest));
   const delivery2 = JSON.stringify({ message_type: 'phone_delivery', text: 'DO note 2.', delivery_id: 'do2' });
   await room.fetch(postReq(delivery2));
   const freshLatest = JSON.parse(await (await room.fetch(latestReq())).text());
-  check('s21: /latest returns the held delivery with its id', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
+  check('s21: /latest returns the held delivery with its id (AHK back-compat)', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
+  check('s21: /latest gains the additive deliveries array', Array.isArray(freshLatest.deliveries) && freshLatest.deliveries.length === 1 && freshLatest.deliveries[0].delivery_id === 'do2', JSON.stringify(freshLatest.deliveries));
+  check('s21: a new delivery prunes the aged one from the ring', room.deliveries.length === 1, room.deliveries.length + ' entries');
+
+  // Ring semantics: the ring caps at DELIVERY_RETAIN_MAX (5), oldest dropped,
+  // order oldest->newest — so a reconnect replays a bounded, ordered set the
+  // desktop's 12-id dedupe ring fully covers.
+  for (let i = 3; i <= 7; i++) {
+    await room.fetch(postReq(JSON.stringify({ message_type: 'phone_delivery', text: 'DO note ' + i + '.', delivery_id: 'do' + i })));
+  }
+  const ringLatest = JSON.parse(await (await room.fetch(latestReq())).text());
+  check('s21: the ring caps at 5 (oldest dropped)', ringLatest.deliveries.length === 5 && ringLatest.deliveries[0].delivery_id === 'do3', JSON.stringify(ringLatest.deliveries.map((d) => d.delivery_id)));
+  check('s21: /latest delivery stays the newest', ringLatest.delivery.delivery_id === 'do7', ringLatest.delivery.delivery_id);
+
+  // /status: presence cue for the phone's pill (listeners + buffered count).
+  const statusReq = () => ({ headers: { get: () => null }, method: 'GET', url: 'https://room/api/session/ABC123/status' });
+  const status21 = JSON.parse(await (await room.fetch(statusReq())).text());
+  check('s21: /status reports listeners + buffered', status21.ok === true && status21.listeners === 2 && status21.buffered === 5, JSON.stringify(status21));
+
+  // Eviction survival: a NEW instance over the same storage rehydrates the ring
+  // and replays it to a connecting listener (the old in-memory slot lost
+  // everything here — the silent stranded-note path).
+  const room2 = new worker.SessionRoom(fakeState(), {});
+  await room2.fetch(wsReq());
+  const listenerE = lastPair.server;
+  const replayed = listenerE.sent.filter(isDeliveryFrame).map((d) => JSON.parse(d).delivery_id);
+  check('s21: deliveries survive room eviction (storage rehydrates + replays)', replayed.length === 5 && replayed[0] === 'do3' && replayed[4] === 'do7', JSON.stringify(replayed));
+
+  // Alarm prune: expired entries are dropped and the storage key deleted —
+  // medical text never lingers server-side past the retention window.
+  check('s21: the cleanup alarm was armed on write', typeof alarmAt === 'number' && alarmAt > Date.now(), String(alarmAt));
+  room2.deliveries.forEach((d) => { d.ts -= 31 * 60 * 1000; });
+  await room2.alarm();
+  check('s21: the alarm prunes expired deliveries from storage', room2.deliveries.length === 0 && mem.get('deliveries') === undefined, JSON.stringify(mem.get('deliveries') || null));
 
   globalThis.Response = RealResponse;
   delete globalThis.WebSocketPair;
@@ -1552,7 +1666,7 @@ console.log('--- scenario 24: QR join ---');
       win.URL.createObjectURL = () => 'blob:mock';
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
       win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks23.push(this); } };
@@ -1604,7 +1718,7 @@ console.log('--- scenario 24: QR join ---');
       win.URL.createObjectURL = () => 'blob:mock';
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.fetch = (url, opts) => {
         fetch23p.push({ url: String(url), opts: opts || {} });
         if (String(url).includes('/deliver')) {
@@ -2833,32 +2947,37 @@ console.log('--- scenario 33: iOS quiet-mic level seed ---');
 }
 
 // ===== Scenario 23p: phone corpse-mic probe (press-path mic health check) =====
-// On the big-button surface a REUSED audio graph can be an iOS corpse (track
-// reports "live"/unmuted but delivers pure silence after a no-event reclaim).
-// Before capture the press reads the analyser ONCE; a flat-zero read forces a
-// fresh getUserMedia so the user's words land on a live mic. A healthy mic always
-// shows a floor, so it pays nothing. micGranted -> the graph warms at boot
-// (audioSuspect false), so the FIRST press REUSES it (the corpse-risk path).
+// On the big-button surface the mic can be an iOS corpse (track reports
+// "live"/unmuted but delivers pure silence after a no-event reclaim) — a REUSED
+// graph or even a FRESH one (the VPIO wall). EVERY press probes the analyser
+// with a short settle window: a dead read forces one fresh getUserMedia, and a
+// mic that is STILL dead fails LOUD **before capture** — REC never starts on a
+// provably silent mic, so the clinician cannot dictate a take into it. A
+// healthy mic shows a floor on frame 0, so a normal press pays nothing.
+// micGranted -> the graph warms at boot (audioSuspect false), so the FIRST
+// press REUSES it (the classic corpse-risk path).
 console.log('--- scenario 23p: phone corpse-mic probe ---');
+const mkProbeDom = (onGum, settings) => new JSDOM(html, {
+  runScripts: 'dangerously', url: 'https://dictation.test/',
+  beforeParse(win) {
+    win.isSecureContext = true;
+    Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+    win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+    win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+    win.AudioContext = MockAudioCtx;
+    win.navigator.mediaDevices = { getUserMedia: () => { onGum(); return Promise.resolve({ getAudioTracks: () => [{ readyState: 'live', muted: false, enabled: true, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] }); }, addEventListener: () => {} };
+    win._fetches = 0;
+    win.fetch = () => { win._fetches++; return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":""}') }); }; // empty transcript -> the loud no-signal finalize
+    win._recStarts = 0;
+    win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { win._recStarts++; this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+    const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+    win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(settings || { micGranted: true, bigButtonMode: 'always' }));
+  },
+});
 {
-  const mkProbeDom = (onGum) => new JSDOM(html, {
-    runScripts: 'dangerously', url: 'https://dictation.test/',
-    beforeParse(win) {
-      win.isSecureContext = true;
-      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
-      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
-      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
-      win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => { onGum(); return Promise.resolve({ getAudioTracks: () => [{ readyState: 'live', muted: false, enabled: true, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] }); }, addEventListener: () => {} };
-      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":""}') }); // empty transcript -> the loud no-signal finalize
-      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
-      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
-      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true, bigButtonMode: 'always' }));
-    },
-  });
-
-  // (a) corpse mic (analyser flat zero) -> the probe forces a pre-capture rebuild,
-  //     and a still-dead mic then fails LOUD (never silently records nothing).
+  // (a) corpse mic (analyser flat zero) on a REUSED graph -> the probe settles
+  //     (~400 ms), forces ONE pre-capture rebuild, re-probes, and a still-dead
+  //     mic fails LOUD **before capture**: no REC, no upload, sentinel copied.
   let gumA = 0;
   const domA = mkProbeDom(() => { gumA++; });
   await sleep(140); // boot: micGranted warms the graph once (audioSuspect cleared)
@@ -2866,16 +2985,18 @@ console.log('--- scenario 23p: phone corpse-mic probe ---');
   docA.getElementById('apiKey').value = 'test-key';
   micRms = 0.0; // corpse: the analyser reads exact zeros
   const gumA0 = gumA;
-  docA.getElementById('recordBtn').click(); // start -> reuse -> probe reads zero -> rebuild
-  await sleep(120);
-  check('s23p: a corpse mic on the phone forces a pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
-  docA.getElementById('recordBtn').click(); // stop -> upload empty -> still zero -> loud failure
-  await sleep(300);
-  check('s23p: a still-dead mic then fails LOUD (MIC PRODUCED NO SIGNAL)', docA.getElementById('status').textContent.includes('MIC PRODUCED NO SIGNAL'), docA.getElementById('status').textContent);
-  check('s23p: the corpse take copies the sentinel', domA.window._clip === '##DICTATION_FAILED##', JSON.stringify(domA.window._clip));
+  const fetchesA0 = domA.window._fetches;
+  docA.getElementById('recordBtn').click(); // press -> probe settles -> rebuild -> re-probe -> loud pre-capture fail
+  await sleep(1300); // two settle windows (2 x 400 ms) + slack
+  check('s23p: a corpse mic forces exactly one pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
+  check('s23p: a still-dead mic fails LOUD before capture (MIC NOT CAPTURING, no REC)', docA.getElementById('status').textContent.includes('MIC NOT CAPTURING') && docA.getElementById('status').textContent.includes('did NOT start'), docA.getElementById('status').textContent);
+  check('s23p: the recorder never started on the dead mic', domA.window._recStarts === 0, 'recStarts ' + domA.window._recStarts);
+  check('s23p: nothing was uploaded for the dead press', domA.window._fetches === fetchesA0, 'fetches delta ' + (domA.window._fetches - fetchesA0));
+  check('s23p: the dead press copies the sentinel', domA.window._clip === '##DICTATION_FAILED##', JSON.stringify(domA.window._clip));
+  check('s23p: the dead press is a fail status', docA.getElementById('status').className.includes('err'), docA.getElementById('status').className);
 
-  // (b) a healthy mic always shows a floor -> the probe is a no-op (NO extra
-  //     getUserMedia), so a normal press pays nothing.
+  // (b) a healthy mic always shows a floor -> the probe exits on frame 0 (NO
+  //     extra getUserMedia, no settle wait), so a normal press pays nothing.
   let gumB = 0;
   const domB = mkProbeDom(() => { gumB++; });
   await sleep(140);
@@ -2886,9 +3007,592 @@ console.log('--- scenario 23p: phone corpse-mic probe ---');
   docB.getElementById('recordBtn').click(); // start -> reuse -> probe reads a floor -> NO rebuild
   await sleep(120);
   check('s23p: a healthy phone mic does NOT trigger a probe rebuild', gumB === gumB0, 'gum delta ' + (gumB - gumB0));
+  check('s23p: a healthy press starts recording promptly', domB.window._recStarts === 1, 'recStarts ' + domB.window._recStarts);
   docB.getElementById('recordBtn').click(); // clean up the take
   await sleep(200);
   micRms = 0.05;
+}
+
+// ===== Scenario 37: FRESH-graph silent capture (the VPIO wall) =====
+// The reused-only probe missed this: after an iOS interruption even a FRESH
+// getUserMedia stream can deliver pure silence while looking live — and on the
+// phone surface most presses ARE fresh graphs (the between-takes corpse guard
+// sets audioSuspect). The press must probe the fresh graph too and fail LOUD
+// pre-capture when it is silent.
+console.log('--- scenario 37: fresh-graph silent capture fails loud BEFORE capture ---');
+{
+  let gum37 = 0;
+  // No micGranted seed: the graph is NOT warmed at boot, so the press builds a
+  // FRESH graph (gum #1), probes it, rebuilds once (gum #2), then fails loud.
+  const dom37 = mkProbeDom(() => { gum37++; }, { bigButtonMode: 'always' });
+  await sleep(140);
+  const doc37 = dom37.window.document;
+  doc37.getElementById('apiKey').value = 'test-key';
+  micRms = 0.0; // the fresh stream is silent (VPIO wall)
+  doc37.getElementById('recordBtn').click();
+  await sleep(1400); // fresh build + two settle windows
+  check('s37: a silent FRESH graph gets one rebuild then fails pre-capture', gum37 === 2, 'gum ' + gum37);
+  check('s37: the fresh-graph silent press is loud (MIC NOT CAPTURING)', doc37.getElementById('status').textContent.includes('MIC NOT CAPTURING'), doc37.getElementById('status').textContent);
+  check('s37: REC never started on the silent fresh graph', dom37.window._recStarts === 0, 'recStarts ' + dom37.window._recStarts);
+  check('s37: sentinel copied for the silent fresh press', dom37.window._clip === '##DICTATION_FAILED##', JSON.stringify(dom37.window._clip));
+  micRms = 0.05;
+}
+
+// ===== Scenario 38: idle mic-health sampler (big-button surface) =====
+// Between takes iOS can kill the retained mic with NO event. The idle sampler
+// reads one analyser frame every MIC_IDLE_PROBE_MS (4 s): two consecutive dead
+// frames -> proactive rebuild while idle (free) + the "Mic ⚠ rebuilding" pill;
+// a live mic shows "Mic ✓". It never runs mid-recording (sessions own the mic;
+// the watchdog covers them).
+console.log('--- scenario 38: idle mic-health sampler (proactive corpse rebuild) ---');
+{
+  let gum38 = 0;
+  const dom38 = mkProbeDom(() => { gum38++; });
+  await sleep(140); // boot warm (gum #1)
+  const doc38 = dom38.window.document;
+  doc38.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc38.getElementById('recordBtn').click(); // healthy press -> recording
+  await sleep(150);
+  check('s38: recording started for the mid-take leg', dom38.window._recStarts === 1, 'recStarts ' + dom38.window._recStarts);
+  micRms = 0.0; // the mic dies mid-take: the sampler must NOT rebuild during a session
+  const gumMid = gum38;
+  await sleep(4400); // one sampler tick while recording
+  check('s38: the sampler never rebuilds mid-recording', gum38 === gumMid, 'gum delta ' + (gum38 - gumMid));
+  doc38.getElementById('recordBtn').click(); // stop (empty take fails loud; not the point here)
+  await sleep(400);
+  const gumIdle = gum38;
+  await sleep(8800); // two idle sampler ticks with a dead mic -> proactive rebuild
+  check('s38: two dead idle frames trigger a proactive rebuild', gum38 === gumIdle + 1, 'gum delta ' + (gum38 - gumIdle));
+  micRms = 0.05; // the rebuilt mic is live again
+  await sleep(4400); // next idle tick sees the floor
+  check('s38: the pill reads Mic ✓ once a live floor is back', doc38.getElementById('bigMicPill').textContent.includes('Mic ✓'), doc38.getElementById('bigMicPill').textContent);
+  micRms = 0.05;
+}
+
+// ===== Scenario 34: manual "Send to desktop" + the queue chip =====
+// The universal recovery for a stranded note: on a joined device, the box, the
+// history rows, and the expanded big-peek can push their text to the desktop
+// through the normal queue+flush+cue path (fresh delivery_id, cleaned text,
+// idle-only). The queue chip makes undelivered notes visible and tap-flushable.
+console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
+{
+  const fetch34 = [];
+  let deliver34 = 'ok'; // 'ok' | 'fail'
+  const dom34 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch34.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/deliver')) {
+          if (deliver34 === 'fail') return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('boom') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Fresh take."}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'SEND01', micGranted: true }));
+      win.localStorage.setItem('scribe_v2_transcripts_v9', JSON.stringify([
+        { text: 'History note from earlier. ', createdAt: new Date().toISOString(), engine: 'batch' },
+      ]));
+    },
+  });
+  await sleep(180);
+  const doc34 = dom34.window.document;
+  const st34 = () => doc34.getElementById('status').textContent;
+  const deliveries34 = () => fetch34.filter((c) => c.url.includes('/deliver') && c.opts && String(c.opts.body).includes('phone_delivery'));
+  doc34.getElementById('apiKey').value = 'test-key';
+
+  // (a) The box's send button: visible when joined, sends the restored note.
+  const sendBtn = doc34.getElementById('sendDesktopBtn');
+  check('s34a: the send button is visible on a joined device', sendBtn.style.display !== 'none' && !sendBtn.disabled, sendBtn.style.display + '/' + sendBtn.disabled);
+  const n0 = deliveries34().length;
+  sendBtn.click();
+  await sleep(250);
+  const sent = deliveries34().slice(n0);
+  check('s34a: the send POSTs a fresh phone_delivery to the joined code', sent.length === 1 && sent[0].url.includes('/api/session/SEND01/deliver'), JSON.stringify(sent.map((c) => c.url)));
+  check('s34a: the sent text is the cleaned box note', sent.length && JSON.parse(sent[0].opts.body).text.includes('History note from earlier.'), sent.length && sent[0].opts.body);
+  check('s34a: a fresh delivery_id rides the manual send', sent.length && !!JSON.parse(sent[0].opts.body).delivery_id, sent.length && sent[0].opts.body);
+  check('s34a: the delivered manual send announces Done', st34().includes('Delivered to the desktop clipboard. Done!'), st34());
+
+  // (b) Mid-session the manual send is a no-op (idle-only guard).
+  micRms = 0.05;
+  doc34.getElementById('recordBtn').click();
+  await sleep(120);
+  const n1 = deliveries34().length;
+  check('s34b: the send button is disabled mid-session', sendBtn.disabled === true, String(sendBtn.disabled));
+  sendBtn.click();
+  await sleep(120);
+  check('s34b: a mid-session send click POSTs nothing', deliveries34().length === n1, deliveries34().length - n1 + ' extra');
+  doc34.getElementById('recordBtn').click(); // stop; the take relays normally (+1 delivery)
+  await sleep(500);
+
+  // (c) History rows carry a per-row send button while joined.
+  doc34.getElementById('toggleHistoryBtn').click();
+  await sleep(30);
+  const rowSend = Array.from(doc34.querySelectorAll('#history button')).find((b) => b.textContent.includes('Send to desktop'));
+  check('s34c: history rows offer Send to desktop while joined', !!rowSend, Array.from(doc34.querySelectorAll('#history button')).map((b) => b.textContent).join('|'));
+  const n2 = deliveries34().length;
+  rowSend.click();
+  await sleep(250);
+  check('s34c: the history-row send delivers that row\'s text', deliveries34().length === n2 + 1, (deliveries34().length - n2) + ' posts');
+
+  // (d) The expanded big-peek offers the send button on the phone surface.
+  doc34.getElementById('bigPeekBar').click(); // expand
+  await sleep(30);
+  const bigSend = doc34.getElementById('bigSendBtn');
+  check('s34d: the expanded big-peek shows Send to desktop again', bigSend.style.display !== 'none', bigSend.style.display);
+
+  // (e) A failed delivery queues + the chip shows; a tap retries and clears it.
+  deliver34 = 'fail';
+  doc34.getElementById('recordBtn').click();
+  await sleep(120);
+  doc34.getElementById('recordBtn').click();
+  await sleep(600);
+  const chip = doc34.getElementById('bigQueueChip');
+  check('s34e: an undelivered note lights the queue chip', chip.style.display !== 'none' && chip.textContent.includes('waiting to send'), chip.textContent);
+  deliver34 = 'ok';
+  chip.click();
+  await sleep(300);
+  check('s34e: tapping the chip flushes the queue', chip.style.display === 'none', chip.style.display + ' / ' + chip.textContent);
+
+  // (f) Unjoined devices never show the send affordances.
+  doc34.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  check('s34f: the send button hides when not joined', sendBtn.style.display === 'none', sendBtn.style.display);
+}
+
+// ===== Scenario 35: desktop /latest poll fallback =====
+// The WS is the primary path, but it dies silently behind Cerner/Citrix
+// (frozen tabs, NAT kills without onclose). The desktop now sweeps the room's
+// fresh deliveries over GET /latest — through the NORMAL message handler, so
+// the dedupe ring and append ownership apply — on foreground and on a timer
+// while the socket is not OPEN. An old worker's single-delivery shape still
+// lands via the fallback.
+console.log('--- scenario 35: desktop /latest poll fallback ---');
+{
+  const fetch35 = [];
+  let latestBody35 = null; // what GET /latest answers
+  let w35;
+  const dom35 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w35 = win;
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url) => {
+        fetch35.push(String(url));
+        if (String(url).includes('/latest')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(latestBody35 || { ok: true, delivery: null, deliveries: [] })) });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // A persisted desktop session: boot resumes the room (WS stays CONNECTING
+      // in the mock — exactly the dead-link regime the poll fallback covers).
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ phoneSessionCode: 'POLL01' }));
+    },
+  });
+  await sleep(150);
+  const doc35 = dom35.window.document;
+  const vis35 = () => { dom35.window.document.dispatchEvent(new dom35.window.Event('visibilitychange')); };
+
+  // (a) Two deliveries wait at the room; the foreground sweep lands BOTH in
+  //     order through the normal handler (newest ends up on the clipboard).
+  latestBody35 = {
+    ok: true,
+    age_ms: 5,
+    delivery: { message_type: 'phone_delivery', text: 'Poll two.', delivery_id: 'p2' },
+    deliveries: [
+      { message_type: 'phone_delivery', text: 'Poll one.', delivery_id: 'p1' },
+      { message_type: 'phone_delivery', text: 'Poll two.', delivery_id: 'p2' },
+    ],
+  };
+  vis35();
+  await sleep(120);
+  check('s35a: the foreground sweep GETs /latest', fetch35.some((u) => u.includes('/api/session/POLL01/latest')), fetch35.join(','));
+  check('s35a: the newest swept delivery reaches the clipboard', (w35._clip || '').includes('Poll two.'), JSON.stringify(w35._clip));
+
+  // (b) Re-sweeping the same ring is deduped by the persisted id ring.
+  w35._clip = 'SWEPT';
+  vis35();
+  await sleep(120);
+  check('s35b: a repeat sweep is deduped (no re-copy)', w35._clip === 'SWEPT', JSON.stringify(w35._clip));
+
+  // (c) Old-worker shape: no deliveries[] — the single delivery still lands.
+  latestBody35 = { ok: true, age_ms: 5, delivery: { message_type: 'phone_delivery', text: 'Old worker note.', delivery_id: 'p3' } };
+  vis35();
+  await sleep(120);
+  check('s35c: an old worker single-delivery shape still lands', (w35._clip || '').includes('Old worker note.'), JSON.stringify(w35._clip));
+
+  // (d) End session: the poll timer is torn down with the rest of the link.
+  doc35.getElementById('phoneStopBtn').click();
+  await sleep(30);
+  const polls0 = fetch35.filter((u) => u.includes('/latest')).length;
+  vis35();
+  await sleep(120);
+  check('s35d: no sweeps after the session ends', fetch35.filter((u) => u.includes('/latest')).length === polls0, fetch35.filter((u) => u.includes('/latest')).length - polls0 + ' extra');
+}
+
+// ===== Scenario 36: desktop-presence pill (phone) =====
+// The phone used to learn the desktop was gone only AFTER a dictation's
+// zero-listener ack. The big screen now polls GET /status and shows
+// "Desktop ✓ / not listening" BEFORE the clinician speaks — a cue, never a
+// gate; hidden on any failure/404 (old worker) so it can never mislead. A
+// positive poll with queued notes flushes them immediately.
+console.log('--- scenario 36: desktop-presence pill (phone /status poll) ---');
+{
+  const fetch36 = [];
+  let status36 = { ok: true, listeners: 1, buffered: 0 }; // /status answer (null => 404)
+  let deliver36 = 'fail';
+  const dom36 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url) => {
+        fetch36.push(String(url));
+        if (String(url).includes('/status')) {
+          if (!status36) return Promise.resolve({ ok: false, status: 404, text: () => Promise.resolve('Not found') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(status36)) });
+        }
+        if (String(url).includes('/deliver')) {
+          if (deliver36 === 'fail') return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('boom') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // A joined phone with one stranded note bound to this code: the flush-on-
+      // presence leg proves a positive /status delivers it immediately.
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({
+        joinedSessionCode: 'STAT01', micGranted: true,
+        pendingDeliveries: [{ id: 'stat-1', text: 'Stranded note.', ts: Date.now(), code: 'STAT01' }],
+      }));
+    },
+  });
+  await sleep(200); // boot: join restores -> big surface -> immediate /status poll (+ the boot flush fails, keeping the note queued)
+  const doc36 = dom36.window.document;
+  const pill36 = doc36.getElementById('bigDesktopPill');
+  check('s36: the boot poll hits /status', fetch36.some((u) => u.includes('/api/session/STAT01/status')), fetch36.join(',').slice(0, 200));
+  check('s36: listeners>0 shows Desktop ✓', pill36.style.display !== 'none' && pill36.textContent.includes('Desktop ✓'), pill36.textContent);
+
+  // Presence + queued note => immediate flush (no backoff wait).
+  deliver36 = 'ok';
+  dom36.window.dispatchEvent(new dom36.window.Event('focus')); // focus re-polls status (and flushes on presence)
+  await sleep(250);
+  const q36 = JSON.parse(dom36.window.localStorage.getItem('scribe_v2_settings_v9')).pendingDeliveries || [];
+  check('s36: presence + queued note flushes immediately', q36.length === 0, JSON.stringify(q36));
+
+  // Zero listeners => the pill warns BEFORE dictating.
+  status36 = { ok: true, listeners: 0, buffered: 0 };
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: zero listeners shows "not listening"', pill36.textContent.includes('not listening') && pill36.className.includes('bad'), pill36.textContent + '/' + pill36.className);
+
+  // Old worker (404) => the pill hides rather than mislead.
+  status36 = null;
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: a 404 /status hides the pill (old worker)', pill36.style.display === 'none', pill36.style.display);
+
+  // Leave tears the pill down with the join.
+  status36 = { ok: true, listeners: 1, buffered: 0 };
+  doc36.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  check('s36: Leave hides the presence pill', pill36.style.display === 'none', pill36.style.display);
+}
+
+// ===== Scenario 25w: joined + degraded outcome — the relay ack must WARN, never doneBeep =====
+// A large speaker-filter cut is a degraded outcome. On a joined phone the relay
+// ack owns the outcome cue — and before this fix a "delivered" ack played the
+// clean doneBeep over degraded content. Now: delivered + degraded ⇒ VERIFY
+// status + warnBeep.
+console.log('--- scenario 25w: joined degraded outcome gets warnBeep on the delivered ack ---');
+{
+  const vibes25w = [];
+  const dom25w = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.vibrate = (p) => { vibes25w.push(p); return true; };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // Two speakers, 3 of 9 words from a bystander: a LARGE (>=15%) removal ⇒ degraded.
+      const words = ['Assessment', 'and', 'plan', 'continue', 'current', 'medications'].map((t) => ({ text: t, type: 'word', speaker_id: 'speaker_0' }))
+        .concat(['did', 'you', 'eat'].map((t) => ({ text: t, type: 'word', speaker_id: 'speaker_1' })));
+      win.fetch = (url) => {
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ text: 'Assessment and plan continue current medications did you eat', words: words })) });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'JOINW1', micGranted: true }));
+    },
+  });
+  await sleep(180); // boot: persisted join restores -> big-button surface (diarize applies)
+  const doc25w = dom25w.window.document;
+  doc25w.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc25w.getElementById('recordBtn').click();
+  await sleep(140);
+  doc25w.getElementById('recordBtn').click();
+  await sleep(450); // upload -> degraded filter -> relay ack (listeners:1)
+  const st25w = doc25w.getElementById('status');
+  check('s25w: delivered ack on a degraded outcome says VERIFY (not Done!)',
+    st25w.textContent.includes('VERIFY') && !st25w.textContent.includes('Done!'), st25w.textContent);
+  check('s25w: degraded relay status is warn class', st25w.className.includes('warn'), st25w.className);
+  check('s25w: the outcome haptic is the WARN pattern, not done',
+    JSON.stringify(vibes25w[vibes25w.length - 1]) === JSON.stringify([90, 90, 90]), JSON.stringify(vibes25w));
+  check('s25w: the filtered primary text still reached the local clipboard',
+    (dom25w.window._clip || '').includes('Assessment and plan continue current medications') && !(dom25w.window._clip || '').includes('did you eat'),
+    JSON.stringify(dom25w.window._clip));
+}
+
+// ===== Scenario 39: transcript-coverage guard =====
+// The reported failure: a multi-minute dictation came back half-transcribed with
+// a clean "Done!". The guard compares the transcript's last word end-time (and
+// the service's decoded duration) against the speech the gate observed; a big
+// shortfall is a degraded WARN — text still delivered — with a diag ring entry.
+console.log('--- scenario 39: transcript-coverage guard ---');
+{
+  const mk39Dom = (state) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      // Skewable clock: the page's Date.now reads real time + skewMs, so a
+      // "5-minute take" runs in milliseconds of wall time. The AudioContext
+      // clock follows the same skewed time so the gate's hold/close advances.
+      const realNow = Date.now.bind(Date);
+      win.Date.now = () => realNow() + state.skewMs;
+      const t0 = realNow();
+      win.AudioContext = class extends MockAudioCtx {
+        constructor() {
+          super();
+          Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state.skewMs - t0) / 1000, configurable: true });
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = (url, fOpts) => new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(state.body)) }), state.delayMs || 5);
+        if (fOpts && fOpts.signal) fOpts.signal.addEventListener('abort', () => { clearTimeout(t); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true }));
+    },
+  });
+
+  // One simulated take: speak (gate open), optionally go silent, then jump the
+  // clock ~290 s so the take reads as multi-minute, tick once more, and stop.
+  const run39 = async (body, opts) => {
+    const state = { skewMs: 0, body: body, delayMs: (opts && opts.delayMs) || 0 };
+    const dom = mk39Dom(state);
+    await sleep(160); // boot (micGranted warms the graph)
+    const doc39 = dom.window.document;
+    doc39.getElementById('apiKey').value = 'test-key';
+    micRms = 0.05;
+    doc39.getElementById('recordBtn').click();
+    await sleep(150); // gate opens; speech observed
+    if (opts && opts.silenceTail) { micRms = 0.0001; await sleep(100); } // true silence (below FLATLINE_RMS)
+    state.skewMs = 290000;
+    await sleep(150); // ticks under the skewed clock (speech continues, or the gate closes)
+    doc39.getElementById('recordBtn').click(); // stop -> upload
+    await sleep(400 + ((opts && opts.delayMs) || 0));
+    micRms = 0.05;
+    return dom.window;
+  };
+  const w39 = (win, sel) => win.document.getElementById(sel);
+  const wordsUntil = (endSec) => [
+    { text: 'First', type: 'word', start: 0.5, end: 1.2 },
+    { text: 'half', type: 'word', start: 1.3, end: 2.0 },
+    { text: 'only', type: 'word', start: endSec - 1, end: endSec },
+  ];
+
+  // (a) transcript stops at ~60 s of a ~290 s spoken take -> degraded WARN,
+  //     text delivered, coverage-shortfall in the diag ring.
+  const winA = await run39({ text: 'First half only.', words: wordsUntil(60), audio_duration_secs: 290 });
+  const stA = w39(winA, 'status');
+  check('s39a: a half-covered transcript is a WARN, never Done!', stA.className.includes('warn') && !stA.textContent.includes('Done!'), stA.textContent + ' / ' + stA.className);
+  check('s39a: the warn says INCOMPLETE + VERIFY', stA.textContent.includes('INCOMPLETE') && stA.textContent.includes('VERIFY'), stA.textContent);
+  check('s39a: the (possibly partial) text is still delivered', (winA._clip || '').includes('First half only.'), JSON.stringify(winA._clip));
+  const ring39 = JSON.parse(winA.localStorage.getItem('scribe_v2_micfail_v9') || '[]');
+  check('s39a: coverage-shortfall recorded in the diag ring', ring39.length && ring39[0].reason === 'coverage-shortfall', JSON.stringify(ring39[0] || null));
+  check('s39a: the diag carries the coverage numbers', ring39.length && ring39[0].diag.includes('lastWordEnd:60s') && ring39[0].diag.includes('deadBand:'), ring39.length ? ring39[0].diag : 'no entry');
+
+  // (b) full coverage (last word ends near the take end) -> clean Done!.
+  const winB = await run39({ text: 'Full note to the end.', words: wordsUntil(285), audio_duration_secs: 290 });
+  const stB = w39(winB, 'status');
+  check('s39b: full coverage stays a clean Done!', stB.textContent.includes('Done!') && stB.className.includes('ok'), stB.textContent + ' / ' + stB.className);
+
+  // (c) words without timestamps + no duration (older shape / API drift) ->
+  //     the guard no-ops; clean Done!.
+  const winC = await run39({ text: 'No timestamps here.', words: [{ text: 'No', type: 'word' }, { text: 'timestamps', type: 'word' }] });
+  const stC = w39(winC, 'status');
+  check('s39c: missing timestamps/duration is a clean no-op', stC.textContent.includes('Done!') && stC.className.includes('ok'), stC.textContent);
+
+  // (d) no words[] but the service decoded far less audio than recorded ->
+  //     degraded WARN via the duration check.
+  const winD = await run39({ text: 'Decoded a fraction.', audio_duration_secs: 120 });
+  const stD = w39(winD, 'status');
+  check('s39d: a short decoded duration is a WARN', stD.className.includes('warn') && stD.textContent.includes('INCOMPLETE'), stD.textContent + ' / ' + stD.className);
+
+  // (e) the gate-open baseline: speech only in the first moments, then TRUE
+  //     silence while the button stays held ~290 s -> the transcript "ends
+  //     early" against wall-clock but NOT against observed speech -> clean.
+  const winE = await run39({ text: 'Short remark.', words: [{ text: 'Short', type: 'word', start: 0.1, end: 0.4 }, { text: 'remark', type: 'word', start: 0.5, end: 0.9 }], audio_duration_secs: 290 }, { silenceTail: true });
+  const stE = w39(winE, 'status');
+  check('s39e: held-but-silent tail does NOT false-warn (gate baseline)', stE.textContent.includes('Done!') && stE.className.includes('ok'), stE.textContent + ' / ' + stE.className);
+}
+
+// ===== Scenario 40: duration-aware upload deadline =====
+// A ~290 s take extends the transcription deadline to ~75 s; a response that
+// arrives after 16 s (past the old flat 15 s abort) must still succeed.
+console.log('--- scenario 40: duration-aware upload deadline (16 s response on a long take succeeds) ---');
+{
+  const state40 = { skewMs: 0, body: { text: 'Long take transcribed late but fine.', words: [{ text: 'fine', type: 'word', start: 288, end: 289 }], audio_duration_secs: 290 }, delayMs: 16000 };
+  const dom40 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      const realNow = Date.now.bind(Date);
+      win.Date.now = () => realNow() + state40.skewMs;
+      const t0 = realNow();
+      win.AudioContext = class extends MockAudioCtx {
+        constructor() {
+          super();
+          Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state40.skewMs - t0) / 1000, configurable: true });
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = (url, fOpts) => new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(state40.body)) }), state40.delayMs);
+        if (fOpts && fOpts.signal) fOpts.signal.addEventListener('abort', () => { clearTimeout(t); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true }));
+    },
+  });
+  await sleep(160);
+  const doc40 = dom40.window.document;
+  doc40.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc40.getElementById('recordBtn').click();
+  await sleep(150);
+  state40.skewMs = 290000; // the take "lasted" ~290 s -> deadline 15 s + min(60 s, 25%) = 75 s
+  await sleep(150);
+  doc40.getElementById('recordBtn').click(); // stop -> upload; response lands after 16 s REAL time
+  await sleep(17000);
+  const st40 = doc40.getElementById('status');
+  check('s40: a 16 s transcription on a long take succeeds (old flat 15 s would abort)',
+    st40.textContent.includes('Done!') && st40.className.includes('ok'), st40.textContent + ' / ' + st40.className);
+  check('s40: the late text reached the clipboard', (dom40.window._clip || '').includes('Long take transcribed late'), JSON.stringify(dom40.window._clip));
+}
+
+// ===== Scenario 41: journal cap honesty =====
+// A crash-recovery capped at JOURNAL_MAX_CHUNKS is REAL but PARTIAL — the
+// banner must say only the first ~N minutes were saved. An uncapped one must not.
+console.log('--- scenario 41: journal cap honesty ---');
+{
+  const JOURNAL_CAP = 1800; // mirrors JOURNAL_MAX_CHUNKS in worker.js
+  const seedJournal = (idb, chunkCount) => new Promise((resolve, reject) => {
+    const req = idb.open('scribe_v2_journal', 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      db.createObjectStore('sessions', { keyPath: 'id' });
+      const cs = db.createObjectStore('chunks', { keyPath: 'k', autoIncrement: true });
+      cs.createIndex('sid', 'sid', { unique: false });
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction(['sessions', 'chunks'], 'readwrite');
+      tx.objectStore('sessions').put({ id: 'jSEED', createdAt: new Date().toISOString(), mimeType: 'audio/webm', joined: false, base: '', state: 'recording' });
+      for (let i = 0; i < chunkCount; i++) tx.objectStore('chunks').put({ sid: 'jSEED', buf: new ArrayBuffer(1024) });
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => reject(tx.error);
+    };
+    req.onerror = () => reject(req.error);
+  });
+  const mk41Dom = (idb) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.indexedDB = idb;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"recovered"}') });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({}));
+    },
+  });
+
+  // (a) a capped orphan (exactly the cap) -> the banner admits the partial save.
+  const idbCap = new IDBFactory();
+  await seedJournal(idbCap, JOURNAL_CAP);
+  const domCap = mk41Dom(idbCap);
+  await sleep(400); // boot -> restoreJournal
+  const msgCap = domCap.window.document.getElementById('journalRecoverMsg').textContent;
+  const shownCap = domCap.window.document.getElementById('journalRecover').style.display !== 'none';
+  check('s41a: a capped recovery banner shows', shownCap, 'display=' + domCap.window.document.getElementById('journalRecover').style.display);
+  check('s41a: a capped recovery says only the first ~30 minutes were saved', msgCap.includes('first 30 minutes') && msgCap.includes('incomplete'), msgCap);
+
+  // (b) an uncapped orphan -> no partial-save note.
+  const idbOk = new IDBFactory();
+  await seedJournal(idbOk, 3);
+  const domOk = mk41Dom(idbOk);
+  await sleep(400);
+  const msgOk = domOk.window.document.getElementById('journalRecoverMsg').textContent;
+  const shownOk = domOk.window.document.getElementById('journalRecover').style.display !== 'none';
+  check('s41b: an uncapped recovery banner shows', shownOk, 'display=' + domOk.window.document.getElementById('journalRecover').style.display);
+  check('s41b: an uncapped recovery has no partial-save note', !msgOk.includes('first 30 minutes'), msgOk);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

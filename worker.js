@@ -4,19 +4,81 @@ import { KEYTERM_PRESETS } from './keyterms.js';
 // here (fire-and-forget); desktop listeners receive them over a WebSocket.
 // Resilience contract with the client:
 //   - answers {"message_type":"ping"} with a pong (zombie-socket detection);
-//   - retains the most recent phone_delivery and replays it to (re)connecting
-//     listeners within the replay window (clients dedupe by delivery_id);
+//   - retains recent phone_deliveries in a small ring PERSISTED to DO storage
+//     (survives room eviction — the old single in-memory slot silently lost
+//     undelivered notes whenever the idle room was reclaimed) and replays every
+//     fresh entry to (re)connecting listeners within the retention window
+//     (clients dedupe by delivery_id, so over-replay can never double-copy);
 //   - acks /broadcast with the listener count, so the phone can fail loudly
-//     when nobody was listening instead of assuming success.
-const DELIVERY_REPLAY_WINDOW_MS = 2 * 60 * 1000;
+//     when nobody was listening instead of assuming success;
+//   - GET /status reports listener presence + buffered count — a cue for the
+//     phone's "desktop connected" pill, never load-bearing;
+//   - a storage alarm prunes the ring, so medical text never lingers
+//     server-side past the retention window (in-memory eviction used to
+//     guarantee that for free; persistence must do it explicitly).
+// Retention matches the phone queue's DELIVERY_QUEUE_TTL_MS judgment of "still
+// safe to auto-land on the desktop" (the phone auto-re-POSTs a note this old
+// anyway — the room path now just matches it; was a 2-min in-memory window).
+const DELIVERY_RETAIN_MS  = 30 * 60 * 1000;
+// Ring size stays UNDER the desktop's 12-id dedupe ring, so replaying the whole
+// ring to a reconnecting listener can never re-copy a note it already saw. A
+// single slot could not replay multi-note losses (a dead-but-open socket "acks"
+// several sends before its pong timeout unmasks it — each overwrote the slot).
+const DELIVERY_RETAIN_MAX = 5;
 
 export class SessionRoom {
   constructor(state, env) {
+    this.state = state || {};
     this.listeners = new Map(); // id -> WebSocket
-    this.lastDelivery = null;   // { body, ts } — most recent phone_delivery
+    this.deliveries = null;     // [{ body, ts }] oldest→newest — lazily loaded from storage
+    this.loading = null;
+  }
+
+  // Load the persisted ring once per instance life. Fully best-effort: absent/
+  // failing storage (tests pass a bare state; a platform storage error) just
+  // degrades to the pre-persistence in-memory behavior — the delivery path
+  // must never 500 because durability was unavailable.
+  async ensureLoaded() {
+    if (this.deliveries) return;
+    if (!this.loading) {
+      this.loading = (async () => {
+        let arr = null;
+        try {
+          if (this.state.storage) arr = await this.state.storage.get("deliveries");
+        } catch {}
+        this.deliveries = Array.isArray(arr) ? arr : [];
+      })();
+    }
+    await this.loading;
+  }
+
+  freshDeliveries(now) {
+    return this.deliveries.filter((d) => d && typeof d.ts === "number" && now - d.ts < DELIVERY_RETAIN_MS);
+  }
+
+  // Prune + cap the ring, write it through (best-effort), and arm the cleanup
+  // alarm so stored text expires even if the room then sits idle.
+  async persistDeliveries(now) {
+    this.deliveries = this.freshDeliveries(now).slice(-DELIVERY_RETAIN_MAX);
+    try {
+      if (this.state.storage) {
+        if (this.deliveries.length) {
+          await this.state.storage.put("deliveries", this.deliveries);
+          if (this.state.storage.setAlarm) await this.state.storage.setAlarm(now + DELIVERY_RETAIN_MS + 1000);
+        } else {
+          await this.state.storage.delete("deliveries");
+        }
+      }
+    } catch {}
+  }
+
+  async alarm() {
+    await this.ensureLoaded();
+    await this.persistDeliveries(Date.now()); // drops everything expired; deletes the key when empty
   }
 
   async fetch(request) {
+    await this.ensureLoaded();
     const url = new URL(request.url);
 
     if (request.headers.get("Upgrade") === "websocket") {
@@ -35,18 +97,35 @@ export class SessionRoom {
           }
         } catch {}
       });
-      // A delivery that raced a listener drop must still reach the desktop.
-      if (this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS) {
-        try { server.send(this.lastDelivery.body); } catch {}
+      // Deliveries that raced a listener drop must still reach the desktop —
+      // replay every fresh entry oldest→newest (the desktop's persisted
+      // delivery_id ring makes an already-seen replay a no-op).
+      for (const d of this.freshDeliveries(Date.now())) {
+        try { server.send(d.body); } catch {}
       }
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (request.method === "GET" && url.pathname.endsWith("/latest")) {
-      const fresh = this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS;
-      const body = fresh
-        ? '{"ok":true,"age_ms":' + (Date.now() - this.lastDelivery.ts) + ',"delivery":' + this.lastDelivery.body + '}'
-        : '{"ok":true,"delivery":null}';
+      const now = Date.now();
+      const fresh = this.freshDeliveries(now);
+      const newest = fresh.length ? fresh[fresh.length - 1] : null;
+      // Back-compat: "delivery" stays the single newest entry (the AHK poller
+      // reads exactly that); "deliveries" (oldest→newest) is additive, for the
+      // desktop's poll fallback to sweep everything it may have missed.
+      const body = newest
+        ? '{"ok":true,"age_ms":' + (now - newest.ts) + ',"delivery":' + newest.body +
+          ',"deliveries":[' + fresh.map((d) => d.body).join(",") + ']}'
+        : '{"ok":true,"delivery":null,"deliveries":[]}';
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }
+
+    if (request.method === "GET" && url.pathname.endsWith("/status")) {
+      // Presence CUE for the phone's pill. listeners.size can briefly include a
+      // zombie socket (until its close event / the desktop's pong timeout), so
+      // this must never gate anything — it only informs.
+      const body = '{"ok":true,"listeners":' + this.listeners.size +
+                   ',"buffered":' + this.freshDeliveries(Date.now()).length + '}';
       return new Response(body, { headers: { "content-type": "application/json" } });
     }
 
@@ -54,7 +133,11 @@ export class SessionRoom {
       const message = await request.text();
       let isDelivery = false;
       try { isDelivery = JSON.parse(message).message_type === "phone_delivery"; } catch {}
-      if (isDelivery) this.lastDelivery = { body: message, ts: Date.now() };
+      if (isDelivery) {
+        const now = Date.now();
+        this.deliveries.push({ body: message, ts: now });
+        await this.persistDeliveries(now); // prune + cap + write-through + alarm
+      }
       let delivered = 0;
       for (const [id, ws] of this.listeners) {
         try { ws.send(message); delivered++; } catch { this.listeners.delete(id); }
@@ -154,9 +237,15 @@ export default {
       }
       // Native pollers (e.g. the AHK script): read the held delivery without
       // joining the room — lets a native app write the clipboard with no
-      // browser-focus requirement.
+      // browser-focus requirement. (The desktop's poll fallback reads the
+      // additive "deliveries" array from the same route.)
       if (request.method === "GET" && parts[4] === "latest") {
         return stub.fetch("https://session-room/latest");
+      }
+      // Desktop-presence cue for the phone's pill ({listeners, buffered}) —
+      // informational only, never gates recording or delivery.
+      if (request.method === "GET" && parts[4] === "status") {
+        return stub.fetch("https://session-room/status");
       }
       return new Response("Not found", { status: 404 });
     }
@@ -568,6 +657,16 @@ const INDEX_HTML = `<!doctype html>
     }
     #bigTopRow { width: 100%; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
     #bigJoinedBadge { font-family: monospace; letter-spacing: 2px; color: var(--accent); font-size: 14px; flex: 1 1 auto; }
+    #bigMicPill, #bigDesktopPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+    #bigMicPill.ok, #bigDesktopPill.ok { color: var(--muted); }
+    #bigMicPill.bad, #bigDesktopPill.bad { color: var(--danger); font-weight: 600; }
+    /* Undelivered-notes chips (phone delivery queue) — tappable, warn-toned. */
+    #queueChip, #bigQueueChip {
+      color: var(--warn); border: 1px solid var(--warn); border-radius: 10px;
+      padding: 2px 10px; font-size: 12.5px; cursor: pointer; user-select: none;
+    }
+    #bigQueueChip { flex: 0 0 auto; text-align: center; margin: 6px auto 0; max-width: 92%; }
+    #bigSendBtn { margin-top: 8px; width: 100%; }
     #bigCenter {
       flex: 1 1 auto; min-height: 0; width: 100%; display: flex;
       flex-direction: column; align-items: center; justify-content: center; gap: 14px;
@@ -679,6 +778,9 @@ const INDEX_HTML = `<!doctype html>
         <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+        <!-- Joined devices only: re-send the note to the desktop clipboard (a
+             fresh delivery — the recovery for a note stranded by a link outage). -->
+        <button id="sendDesktopBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery, even if the link was down when it was dictated">📤 Send to desktop</button>
       </div>
 
       <!-- "Last dictation" slot: the most recently filed note. The box above is
@@ -699,6 +801,9 @@ const INDEX_HTML = `<!doctype html>
              the desktop user knows audio is being captured before the text lands.
              Hidden until a phone_recording ping arrives (relayed, not buffered). -->
         <span id="phoneRecBadge" style="display:none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600;"></span>
+        <!-- Undelivered-notes chip: visible only while the phone-side delivery
+             queue holds something (compactness contract) — tap retries now. -->
+        <span id="queueChip" style="display:none" role="button"></span>
       </div>
     </section>
 
@@ -868,12 +973,18 @@ right lower quadrant"></textarea>
               Tag audio events ((laughter), (cough), …) — batch transcription only
             </label>
 
-            <label for="timestamps">Timestamps</label>
-            <select id="timestamps">
-              <option value="none" selected>none</option>
-              <option value="word">word</option>
-              <option value="character">character</option>
-            </select>
+            <!-- Retired: word timestamps are now ALWAYS requested (the
+                 transcript-coverage guard needs per-word end times on every
+                 dictation). Hidden, not removed, so the persisted "timestamps"
+                 settings field keeps round-tripping (sonioxKey precedent). -->
+            <div style="display:none">
+              <label for="timestamps">Timestamps</label>
+              <select id="timestamps">
+                <option value="none" selected>none</option>
+                <option value="word">word</option>
+                <option value="character">character</option>
+              </select>
+            </div>
           </div>
 
           <h3>How do these settings work?</h3>
@@ -908,10 +1019,13 @@ right lower quadrant"></textarea>
   <div id="bigUi" data-screen="idle">
     <div id="bigTopRow">
       <span id="bigJoinedBadge"></span>
+      <span id="bigMicPill" style="display:none"></span>
+      <span id="bigDesktopPill" style="display:none"></span>
       <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
       <button id="bigLeaveBtn">Leave</button>
       <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
     </div>
+    <div id="bigQueueChip" style="display:none" role="button"></div>
     <div id="bigCenter">
       <div id="bigState">READY</div>
       <button id="bigBtn">HOLD TO TALK</button>
@@ -921,6 +1035,7 @@ right lower quadrant"></textarea>
     <div id="bigPeek">
       <div id="bigPeekBar">Latest transcript — tap to expand</div>
       <div id="bigPeekText"></div>
+      <button id="bigSendBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery">📤 Send to desktop again</button>
     </div>
   </div>
   <button id="bigReturnBtn">&#8592; Back to the button</button>
@@ -1002,6 +1117,10 @@ right lower quadrant"></textarea>
   const recordBtn        = document.getElementById("recordBtn");
   const clearBtn         = document.getElementById("clearBtn");
   const copyBtn          = document.getElementById("copyBtn");
+  const sendDesktopBtn   = document.getElementById("sendDesktopBtn");
+  const queueChipEl      = document.getElementById("queueChip");
+  const bigQueueChipEl   = document.getElementById("bigQueueChip");
+  const bigSendBtnEl     = document.getElementById("bigSendBtn");
   const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
   const lastDictationEl     = document.getElementById("lastDictation");
@@ -1095,6 +1214,8 @@ right lower quadrant"></textarea>
   const bigStateEl       = document.getElementById("bigState");
   const bigStatusEl      = document.getElementById("bigStatus");
   const bigJoinedBadgeEl = document.getElementById("bigJoinedBadge");
+  const bigMicPillEl     = document.getElementById("bigMicPill");
+  const bigDesktopPillEl = document.getElementById("bigDesktopPill");
   const bigLeaveBtnEl    = document.getElementById("bigLeaveBtn");
   const bigSettingsBtnEl = document.getElementById("bigSettingsBtn");
   const bigReturnBtnEl   = document.getElementById("bigReturnBtn");
@@ -1161,8 +1282,19 @@ right lower quadrant"></textarea>
   let pendingStartTimer = null; // armed deferred start from maybePendingStart; cancellable until it fires
   let lastWsError = "";
   let recStartedAt = 0;
+  let recEndedAt = 0;        // stamped at finalize entry; recEndedAt - recStartedAt = take length
   let speechDetected = false;
   let maxRmsSeen = 0;
+  // Coverage bookkeeping (30 ms gate-loop granularity). The truncation guard
+  // baselines on the LAST gate-open moment — never wall-clock hold time — so a
+  // clinician who keeps the button pressed after finishing a sentence is not
+  // told the transcript is incomplete. deadBandMs is diagnostics-only: a tail of
+  // gate-closed-but-nonsilent audio is the signature of mic-level drift (the
+  // gate silencing real speech), but warning on it would false-positive on
+  // ordinary ambient noise floors.
+  let gateOpenMs = 0;        // ms the gate spent open this take
+  let lastGateOpenAtMs = 0;  // wall-clock ms when the gate was last open
+  let deadBandMs = 0;        // ms gate-closed with RMS in [FLATLINE_RMS, gateOpen)
   let micAlarmFired = false;
   let mutedSince = 0;
   let ctxNotRunningSince = 0; // ms the AudioContext has been non-"running" mid-dictation; debounces the interruption alarm so a transient iOS blip doesn't fail a healthy take
@@ -1179,6 +1311,8 @@ right lower quadrant"></textarea>
   let phoneReconnectTimer = null; // desktop: pending reconnect attempt
   let phoneReconnectDelayMs = 0;  // desktop: current reconnect backoff
   let phoneFallbackTimer = null;  // desktop: grace timer before live-text fallback delivery
+  let phonePollTimer    = null; // desktop: /latest poll-fallback interval (fires only while the WS is not OPEN)
+  let statusPollTimer   = null; // phone: /status presence-poll interval (big-button surface only)
   let lastDeliveryId    = "";   // desktop: most recent phone_delivery id (migrated into recentDeliveryIds)
   let recentDeliveryIds = [];   // desktop: ring of recent ids — dedupes BOTH room replays and retried/out-of-order re-POSTs
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
@@ -1234,9 +1368,10 @@ right lower quadrant"></textarea>
   // looks engaged but records silence. Any backgrounding sets this; ensureAudio
   // then forces a full rebuild (a fresh getUserMedia track is genuinely live).
   let audioSuspect = false;
-  // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild). A reused
-  // graph is the iOS corpse-mic risk (track reports "live"/unmuted but delivers
-  // silence after a no-event session reclaim); the press-path probe guards it.
+  // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild).
+  // Bookkeeping only since the press-path probe went unconditional on the phone
+  // surface (probeMicAlive covers reused AND fresh graphs — a fresh iOS stream
+  // can itself be silent after an interruption).
   let audioReused = false;
   let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
   let gateIsOpen = false;
@@ -1276,11 +1411,23 @@ right lower quadrant"></textarea>
   const IOS_AUDIO_SEED_VERSION = 1;     // bump to re-push a corrected seed to un-tuned installs (additive, no _v9 bump)
   const IOS_SEED_MIC_GAIN      = 3;     // makeup gain x — deterministic + observable (gain:Nx in micDiag), unlike AGC
   const IOS_SEED_GATE_OPEN     = 0.018; // gate open threshold — well above gateClose 0.008
-  // Press-path corpse-mic probe (phone surface): one analyser frame on the REUSED
-  // mic below this RMS (a live mic always has a tiny floor; an iOS corpse delivers
-  // exact zeros) forces a fresh-getUserMedia rebuild so the take lands on a live
-  // mic. See probeMicLive.
+  // Press-path corpse-mic probe (phone surface): an analyser frame below this RMS
+  // means no audio is flowing (a live mic always has a tiny floor; an iOS corpse
+  // delivers exact zeros). EVERY big-button press probes — reused graphs exit on
+  // frame 0 (the analyser continuously reflects the live mic), a FRESH graph gets
+  // a short settle window for its first buffers (silence there isn't capturable
+  // anyway, so the wait can never swallow speech); only a dead mic pays the full
+  // bound, and a mic still dead after one forced rebuild fails LOUD before
+  // capture. See probeMicAlive + the startRecording press path.
   const MIC_PROBE_DEAD_RMS  = 0.00001;
+  const MIC_PROBE_SETTLE_MS = 400; // max wait for a first nonzero frame (fresh live graphs show one within ~1-3 frames)
+  const MIC_PROBE_FRAME_MS  = 30;  // probe poll cadence — matches the gate loop
+  // Idle mic-health sampler (big-button surface): iOS can kill the retained mic
+  // between takes with NO event while it keeps reporting "live". Sampling one
+  // analyser frame every few seconds catches the corpse while idle — rebuild
+  // then is free (nobody is speaking) and the next press lands on a live mic.
+  const MIC_IDLE_PROBE_MS   = 4000; // sampling cadence while idle + visible
+  const MIC_IDLE_DEAD_COUNT = 2;    // consecutive dead frames before rebuilding (one frame can race a teardown)
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -1294,7 +1441,21 @@ right lower quadrant"></textarea>
   const DIARIZE_PRIMARY_MIN_SHARE = 0.6;  // dominant speaker must hold ≥60% of words to filter at all
   const DIARIZE_WARN_SHARE        = 0.15; // dropping ≥15% of words is degraded, not a clean "Done!"
 
-  const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
+  const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline FLOOR fails fast on a hung request (was 30s); long takes extend it via batchUploadTimeoutMs
+  // The transcription deadline scales with the take length: a flat 15 s starves
+  // a multi-minute upload+transcription that is SUCCEEDING (a real failure mode
+  // in the field), while a hung request still dies loudly — just later. Capped
+  // so a black-holed POST can never stall a session past ~75 s.
+  const UPLOAD_TIMEOUT_REC_FRAC     = 0.25;  // extra deadline per recorded second
+  const UPLOAD_TIMEOUT_EXTRA_MAX_MS = 60000; // cap on that extra (floor + cap = 75 s worst case; hotkey.ahk CLIP_TIMEOUT must cover it)
+
+  // Transcript-coverage guard: a batch result whose last word ends well short of
+  // the speech the gate observed (or whose decoded audio is far shorter than the
+  // recording) is DEGRADED — warn + verify, never a clean "Done!". The slack
+  // absorbs trailing-silence PTT habits and normal pauses; the fraction
+  // dominates on long takes so proportionally small tails never false-warn.
+  const COVERAGE_MIN_SLACK_S = 20;   // absolute slack floor (seconds)
+  const COVERAGE_SLACK_FRAC  = 0.25; // fractional slack (of the recorded length)
 
   // Phone link (desktop listener <-> session room)
   const PHONE_PING_INTERVAL_MS  = 25000; // heartbeat cadence on the listener socket
@@ -1302,6 +1463,8 @@ right lower quadrant"></textarea>
   const PHONE_RECONNECT_MAX_MS  = 15000; // reconnect backoff cap
   const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
   const RELAY_TIMEOUT_MS        = 10000; // phone->room delivery ack deadline; a hung relay must fail loudly, and the queued next session waits on the ack
+  const POLL_LATEST_MS          = 10000; // desktop /latest poll-fallback cadence while the listener WS is not OPEN (hidden tabs are browser-throttled to ~1/min — still lands a note within a minute instead of never)
+  const STATUS_POLL_MS          = 25000; // phone: desktop-presence /status poll cadence for the big-screen pill (a cue, never a gate)
 
   // Phone-side durable delivery queue: an undelivered relay (POST failed, or a
   // zero-listener ack means the desktop was down past the room's 2-min replay
@@ -1532,6 +1695,12 @@ right lower quadrant"></textarea>
     const busy = recording || stopping || finishing;
     if (copyBtn)  copyBtn.disabled  = !hasText || busy;
     if (freshBtn) freshBtn.disabled = busy;
+    // Manual desktop re-send: joined devices only, idle-only (its outcome cue
+    // must never collide with a live session's single beep).
+    if (sendDesktopBtn) {
+      sendDesktopBtn.style.display = joinedSessionCode ? "" : "none";
+      sendDesktopBtn.disabled = !hasText || busy;
+    }
     updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
     if (!hasText || busy) {
       appendChipEl.style.display = "none";
@@ -1904,6 +2073,13 @@ right lower quadrant"></textarea>
         deliveryQueue = s.pendingDeliveries.filter(function (it) {
           return it && typeof it.id === "string" && typeof it.text === "string" && typeof it.ts === "number";
         });
+        // Migrate legacy (pre code-binding) items: they can only have been
+        // enqueued under the join persisted alongside them (the old code wiped
+        // the queue on every code switch), so stamping that code is faithful —
+        // and keeps a stranded note flushable after this update lands.
+        deliveryQueue.forEach(function (it) {
+          if (typeof it.code !== "string") it.code = joinedSessionCode || "";
+        });
       }
       if (s.micGranted === true) micEverGranted = true;
       if (s.micTipsSeen === true) micTipsSeen = true;
@@ -1956,7 +2132,7 @@ right lower quadrant"></textarea>
      no-ops if IndexedDB is missing or fails, so a journal problem never touches
      the live capture/upload path — it can only ever NARROW the loss window. */
   const JOURNAL_DB_NAME   = "scribe_v2_journal";
-  const JOURNAL_MAX_CHUNKS = 600; // soft cap (~10 min @ 1s timeslice) — bound the write cost; the in-memory path is unaffected past this
+  const JOURNAL_MAX_CHUNKS = 1800; // soft cap (~30 min @ 1s timeslice ≈ 14 MB IDB) — bound the write cost; the in-memory path is unaffected past this; a capped recovery SAYS so (showJournalRecover)
   let journalDb = null;
   let journalDisabled = (typeof indexedDB === "undefined");
   let journalSessionId = null;   // id of the in-flight take's journal record (null = not journaling)
@@ -2065,16 +2241,20 @@ right lower quadrant"></textarea>
       const blob = bufs.length ? new Blob(bufs, { type: newest.mimeType || "audio/webm" }) : null;
       if (!blob || blob.size < 1024) { try { await journalClear(newest.id); } catch (e) {} return; }
       pendingRecovery = { session: newest, blob: blob };
-      showJournalRecover(newest);
+      // At the cap the journal stopped mirroring mid-take: the recovery is real
+      // but PARTIAL — the banner must say so (a silently half-recovered note is
+      // the same wrong-text failure the journal exists to prevent).
+      showJournalRecover(newest, bufs.length >= JOURNAL_MAX_CHUNKS);
     } catch (e) {}
   }
 
-  function showJournalRecover(session) {
+  function showJournalRecover(session, capped) {
     if (!journalRecoverEl) return;
     let when = "";
     try { when = new Date(session.createdAt).toLocaleString(); } catch (e) {}
     if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
-      "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it.";
+      "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it." +
+      (capped ? " NOTE: only about the first " + Math.round(JOURNAL_MAX_CHUNKS / 60) + " minutes of audio were saved — the recovered text will be incomplete." : "");
     journalRecoverEl.style.display = "";
     warnBeep(); // loud: an un-recovered dictation is a potentially lost note
   }
@@ -2093,7 +2273,9 @@ right lower quadrant"></textarea>
     if (journalRecoverBtn) journalRecoverBtn.disabled = true;
     setStatus("Recovering the interrupted dictation — uploading its audio…", "warn");
     const fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
-    const r = await batchTranscribe(rec.blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+    // Duration estimated from size (64 kbps ⇒ 8 bytes/ms): a long recovered take
+    // needs the same extended transcription deadline as a live one.
+    const r = await batchTranscribe(rec.blob, fileName, batchUploadTimeoutMs(rec.blob.size / 8));
     if (journalRecoverBtn) journalRecoverBtn.disabled = false;
     if (!r.ok || !r.text || !r.text.trim()) {
       setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try Recover again.", "err");
@@ -2217,6 +2399,18 @@ right lower quadrant"></textarea>
       copy.onclick = () => copyText(text.textContent);
 
       row.append(copy);
+
+      // Joined: any past note can be pushed to the desktop clipboard — the
+      // recovery for a note stranded by a link outage (even one that aged past
+      // the delivery-queue TTL or is bound to an old session code).
+      if (joinedSessionCode) {
+        const send = document.createElement("button");
+        send.textContent = "📤 Send to desktop";
+        send.title = "Send this note to the desktop clipboard (a fresh delivery)";
+        send.onclick = () => sendTextToDesktop(text.textContent);
+        row.append(send);
+      }
+
       div.append(meta, text, row);
       historyEl.append(div);
     }
@@ -2337,7 +2531,11 @@ right lower quadrant"></textarea>
     if (SHARED_MODE) form.append("passphrase", passphraseEl.value.trim());
     form.append("file", blob, fileName);
     form.append("file_format", "other");
-    form.append("timestamps_granularity", timestampsEl.value);
+    // Always request word timestamps: the transcript-coverage guard needs per-
+    // word end times on EVERY dictation to catch a silently truncated result
+    // (the old Advanced select defaulted to "none", which left the client blind
+    // to a half-length transcript — it is retired/hidden, not removed).
+    form.append("timestamps_granularity", "word");
     form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
     form.append("tag_audio_events", String(tagEventsEl.checked));
     form.append("diarize", String(diarizeActive())); // keep-primary-speaker: drop bystander voices — phone/big-button surface only
@@ -2369,13 +2567,20 @@ right lower quadrant"></textarea>
       var removedWords = 0;
       var removedShare = 0;
       var unfilteredText = "";
+      // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
+      // measures what the service transcribed, not what the filter kept) and the
+      // decoded audio duration. Both null when absent so the guard can only ever
+      // no-op on missing data, never false-warn.
+      var words = (Array.isArray(data.words) && data.words.length) ? data.words : null;
+      var audioDurationSecs = (typeof data.audio_duration_secs === "number" && isFinite(data.audio_duration_secs))
+        ? data.audio_duration_secs : null;
       // Keep only the primary speaker when diarization is active. A failure to find
       // a clear-minority second speaker (or any words[]) leaves the full text
       // untouched — the filter can only ever REMOVE a clear bystander, never empty
       // a clean note. When it does cut, keep the unfiltered text so a wrongly
       // dropped clinician utterance is recoverable from history.
-      if (diarizeActive() && Array.isArray(data.words) && data.words.length) {
-        var prim = keepPrimarySpeaker(data.words);
+      if (diarizeActive() && words) {
+        var prim = keepPrimarySpeaker(words);
         if (prim && prim.text.trim() && prim.removedWords > 0) {
           unfilteredText = text;
           text = prim.text;
@@ -2383,7 +2588,7 @@ right lower quadrant"></textarea>
           removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
         }
       }
-      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText };
+      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs };
     } catch (err) {
       const aborted = err && err.name === "AbortError";
       return {
@@ -2466,8 +2671,8 @@ right lower quadrant"></textarea>
   // per-device ring (so the root cause can be inspected later, not just glimpsed
   // on a red screen) and console.warn it. Returns the diag string so the caller
   // can also append it to the visible status — one micDiag() call, two sinks.
-  function recordMicFailure(reason) {
-    var diag = micDiag();
+  function recordMicFailure(reason, extraDiag) {
+    var diag = micDiag() + (extraDiag || "");
     try {
       var log = JSON.parse(localStorage.getItem(MICFAIL_LOG_KEY) || "[]");
       if (!Array.isArray(log)) log = [];
@@ -2492,30 +2697,74 @@ right lower quadrant"></textarea>
   }
 
   // Press-path corpse-mic catch (phone surface). After a NO-EVENT iOS session
-  // reclaim (Low Power Mode, an idle gap) the mic track keeps reporting
-  // "live"/unmuted but delivers pure silence (peak:0.00000) — audioGraphHealthy()
-  // trusts it and ensureAudio() REUSES it, so the take records nothing. When the
-  // graph was reused (a fresh rebuild is already genuinely live), read the
-  // analyser ONCE before capture: it continuously reflects the live mic (the
-  // AudioContext processes audio even while idle), so a single frame tells a
-  // corpse (exact zeros) from a live mic (always a tiny nonzero floor) with NO
-  // delay to the press — only a detected corpse pays the rebuild. Forcing ONE
-  // fresh getUserMedia lands the user's words on a live mic. Fully defensive: it
-  // can only ever ADD a rebuild, never block or break the press — a mic still
-  // dead after the rebuild then fails loud via the watchdog / the "MIC PRODUCED
-  // NO SIGNAL" finalize path, never silently.
-  async function probeMicLive() {
+  // reclaim (Low Power Mode, an idle gap, the VPIO wall after an interruption)
+  // the mic — a REUSED graph or even a FRESH getUserMedia stream — can report
+  // "live"/unmuted while delivering pure silence (peak:0.00000), so the take
+  // would record nothing. Read analyser frames until a live floor shows: a warm
+  // graph exits on frame 0 (the analyser continuously reflects the live mic —
+  // NO delay to the press), a fresh live graph within a frame or two while its
+  // first buffers fill (that audio isn't capturable yet anyway, so the wait can
+  // never swallow speech). Only a dead mic pays the full MIC_PROBE_SETTLE_MS
+  // bound. Returns true = live floor seen; false = flat silence throughout.
+  // Best-effort: any internal failure returns true so the probe can never block
+  // a press the rest of the pipeline vetted (the watchdog stays the backstop).
+  async function probeMicAlive() {
     try {
-      if (!bigButtonActive() || !analyserNode || !gateBuf) return;
+      if (!analyserNode || !gateBuf) return true;
+      var deadline = Date.now() + MIC_PROBE_SETTLE_MS;
+      for (;;) {
+        analyserNode.getFloatTimeDomainData(gateBuf);
+        var sum = 0;
+        for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
+        if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise(function (r) { setTimeout(r, MIC_PROBE_FRAME_MS); });
+      }
+    } catch (e) { return true; }
+  }
+
+  // Tiny mic-health pill on the big-button top row: "Mic ✓" (idle sampler saw a
+  // live floor) / "Mic ⚠ rebuilding" (a corpse was detected and is being
+  // rebuilt). A cue, never load-bearing — hidden whenever there is no verdict.
+  function setBigMicPill(state) {
+    if (!bigMicPillEl) return;
+    if (!state || !bigButtonActive()) { bigMicPillEl.style.display = "none"; return; }
+    bigMicPillEl.style.display = "";
+    if (state === "ok") { bigMicPillEl.textContent = "Mic ✓"; bigMicPillEl.className = "ok"; }
+    else { bigMicPillEl.textContent = "Mic ⚠ rebuilding"; bigMicPillEl.className = "bad"; }
+  }
+
+  // Idle mic-health sampler (big-button surface). Between takes iOS can kill the
+  // retained mic with NO event while it keeps reporting "live"; the wake lock
+  // reduces but does not eliminate it. One analyser frame every few seconds
+  // while idle + visible catches the corpse BEFORE the next press: rebuild is
+  // free while nobody is speaking, and the pill shows the verdict. Cue +
+  // proactive heal only — the press-path probe and the watchdog stay the
+  // load-bearing guards. Fully try/caught; must never break anything.
+  let micIdleTimer = null;
+  let micIdleDeadFrames = 0;
+  function micIdleSample() {
+    try {
+      if (!bigButtonActive() || document.visibilityState !== "visible") return;
+      if (recording || stopping || finishing) { micIdleDeadFrames = 0; return; } // sessions own the mic; the watchdog covers them
+      if (!analyserNode || !gateBuf || !audioGraphHealthy()) { micIdleDeadFrames = 0; setBigMicPill(""); return; } // cold or mid-rebuild: no verdict
       analyserNode.getFloatTimeDomainData(gateBuf);
       var sum = 0;
       for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
-      var rms = Math.sqrt(sum / gateBuf.length);
-      if (rms >= MIC_PROBE_DEAD_RMS) return; // a live floor is present — healthy, proceed with no delay
-      audioSuspect = true; // force ensureAudio to skip the healthy-reuse fast path
-      releaseAudio();
-      await ensureAudio();
-    } catch (e) { /* best-effort: a probe failure must never block the press */ }
+      if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) {
+        micIdleDeadFrames = 0;
+        setBigMicPill("ok");
+        return;
+      }
+      micIdleDeadFrames++;
+      if (micIdleDeadFrames >= MIC_IDLE_DEAD_COUNT) {
+        micIdleDeadFrames = 0;
+        setBigMicPill("dead");
+        audioSuspect = true; // the retained graph is a corpse — force a true rebuild
+        releaseAudio();
+        tryWarmOnLoad(); // warmWithRetry path: visible warn status if it keeps failing
+      }
+    } catch (e) {}
   }
 
   // Fire the mid-dictation interruption alarm IFF the AudioContext is still
@@ -2716,6 +2965,14 @@ right lower quadrant"></textarea>
         if (rms > maxRmsSeen) maxRmsSeen = rms;
         if (rms > openT) speechDetected = true;
 
+        // Coverage bookkeeping for the truncation guard (gateIsOpen was updated
+        // just above, so this tick's state is current). Dead-band time — signal
+        // present but below the gate while it is closed — is the gate-drift
+        // signature (recorded as silence though the clinician kept talking);
+        // logged for diagnosis, never used to warn.
+        if (gateIsOpen) { gateOpenMs += 30; lastGateOpenAtMs = nowMs; }
+        else if (rms >= FLATLINE_RMS && rms < openT) deadBandMs += 30;
+
         const track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
         const trackDead = !track || track.readyState !== "live";
         if (track && track.muted) {
@@ -2876,13 +3133,32 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
-    // Phone corpse-mic catch: a REUSED graph can be an iOS corpse (looks live,
-    // delivers silence) after a no-event reclaim, so the take would record pure
-    // silence. Probe the analyser before capture and rebuild if it reads flat
-    // zero. Only when the graph was reused (a fresh rebuild is already live) and
-    // only on the big-button surface, so a normal press pays nothing; the probe
-    // is fully best-effort and can never break the press.
-    if (audioReused && bigButtonActive()) await probeMicLive();
+    // Phone corpse-mic catch — EVERY press on the big-button surface (not just
+    // reused graphs: between takes the corpse guard sets audioSuspect, so most
+    // phone presses are FRESH graphs — and a fresh post-interruption iOS stream
+    // can itself be silent, the VPIO wall the echo-cancellation toggle did not
+    // fix). A live mic costs ~0 ms (frame-0 exit); a dead one gets ONE forced
+    // rebuild + re-probe, and if it is STILL dead the press fails LOUD **before
+    // capture** — never show REC on a mic that is provably delivering silence
+    // (the clinician would dictate the whole take into a corpse and lose it to
+    // the watchdog after the fact).
+    if (bigButtonActive()) {
+      let micAlive = await probeMicAlive();
+      if (!micAlive) {
+        audioSuspect = true; // skip the healthy-reuse fast path — force a true rebuild
+        try { releaseAudio(); await ensureAudio(); } catch (e) {}
+        micAlive = await probeMicAlive();
+      }
+      if (!micAlive) {
+        await writeSentinel();
+        setMicPill("fail");
+        setBigMicPill("dead");
+        setStatus("MIC NOT CAPTURING — the mic is delivering silence, so recording did NOT start (nothing was lost). Press again; if it repeats, relaunch the app." + recordMicFailure("precapture-dead-mic"), "err");
+        failBeep();
+        return;
+      }
+      setBigMicPill("ok");
+    }
     if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
     if (!audioCtx || audioCtx.state !== "running") {
       await writeSentinel();
@@ -2916,8 +3192,12 @@ right lower quadrant"></textarea>
     stopPhase = null;
     lastWsError = "";
     recStartedAt = Date.now();
+    recEndedAt = 0;
     speechDetected = false;
     maxRmsSeen = 0;
+    gateOpenMs = 0;
+    lastGateOpenAtMs = 0;
+    deadBandMs = 0;
     micAlarmFired = false;
     mutedSince = 0;
     ctxNotRunningSince = 0;
@@ -3037,6 +3317,7 @@ right lower quadrant"></textarea>
   async function finalizeSession(unexpected) {
     if (sessionFinalized) return;
     sessionFinalized = true;
+    recEndedAt = Date.now(); // take length for the coverage guard + the duration-aware upload deadline
     clearSessionTimers();
     showRecFeedback(false); // recording is over; the status line carries the upload state
 
@@ -3084,6 +3365,59 @@ right lower quadrant"></textarea>
     await finishBatchSession(unexpected);
   }
 
+  // Upload deadline for a take of recMs: floor + a duration-proportional extra,
+  // capped. Also used for the journal recovery re-upload (duration estimated
+  // from the blob size at 64 kbps = 8 bytes/ms).
+  function batchUploadTimeoutMs(recMs) {
+    var extra = Math.min(UPLOAD_TIMEOUT_EXTRA_MAX_MS, Math.round(Math.max(0, recMs || 0) * UPLOAD_TIMEOUT_REC_FRAC));
+    return BATCH_UPLOAD_TIMEOUT_MS + extra;
+  }
+
+  function fmtMinSec(sec) {
+    var s = Math.max(0, Math.round(Number(sec) || 0));
+    var r = s % 60;
+    return Math.floor(s / 60) + ":" + (r < 10 ? "0" : "") + r;
+  }
+
+  // Transcript-coverage guard. Returns null (no concern) or { message,
+  // expectedSec, lastEnd } when the result stops well short of the speech the
+  // gate observed: the transcript's last word ends much earlier than the last
+  // gate-open moment (service dropped a tail the audio contains), or the
+  // service decoded far less audio than was recorded (upload/decode
+  // truncation). Baselined on the LAST GATE-OPEN moment — never the wall-clock
+  // hold — so a clinician who keeps the button pressed after finishing must
+  // not be told the transcript is incomplete. Null-safe on missing
+  // words[]/timestamps/duration: absent data can only mean "no warning",
+  // never a false one.
+  function coverageShortfall(r, recMs) {
+    try {
+      if (!recMs || recMs <= 0) return null;
+      var recSec = recMs / 1000;
+      var expectedSec = recSec;
+      if (lastGateOpenAtMs > recStartedAt) {
+        expectedSec = Math.min(recSec, (lastGateOpenAtMs - recStartedAt) / 1000);
+      }
+      var slack = Math.max(COVERAGE_MIN_SLACK_S, COVERAGE_SLACK_FRAC * recSec);
+      var lastEnd = 0;
+      if (Array.isArray(r.words)) {
+        for (var i = 0; i < r.words.length; i++) {
+          var w = r.words[i];
+          if (w && typeof w.end === "number" && isFinite(w.end) && w.end > lastEnd) lastEnd = w.end;
+        }
+      }
+      var transcriptShort = lastEnd > 0 && expectedSec - lastEnd > slack;
+      var decodedShort = typeof r.audioDurationSecs === "number" && recSec - r.audioDurationSecs > slack;
+      if (!transcriptShort && !decodedShort) return null;
+      var coveredSec = transcriptShort ? lastEnd : r.audioDurationSecs;
+      return {
+        message: "⚠ Transcript may be INCOMPLETE — covered " + fmtMinSec(coveredSec) +
+                 " of " + fmtMinSec(expectedSec) + " of speech recorded. VERIFY the end of the note!",
+        expectedSec: expectedSec,
+        lastEnd: lastEnd,
+      };
+    } catch (e) { return null; }
+  }
+
   // Pure batch delivery: upload the post-gate recording, splice the result
   // onto the note base, and hand off to the shared delivery exit.
   async function finishBatchSession(unexpected) {
@@ -3118,7 +3452,8 @@ right lower quadrant"></textarea>
     setLinkPill("uploading");
     setStatus("Uploading audio for transcription…", "warn");
 
-    const r = await batchTranscribe(blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+    const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
+    const r = await batchTranscribe(blob, fileName, batchUploadTimeoutMs(recMs));
 
     if (!r.ok) {
       lastWsError = r.error || "upload failed"; // surfaces in the failure status line
@@ -3152,6 +3487,27 @@ right lower quadrant"></textarea>
       ? ("Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers." +
          (degraded ? " VERIFY nothing of yours was dropped — the unfiltered version is saved in history." : ""))
       : "";
+
+    // Coverage guard: a partial result must never read as a clean "Done!". The
+    // text is still delivered (it is real, just possibly incomplete); the diag
+    // ring gets the full picture so the next field report can tell a service
+    // truncation (gate open to the end, deadBand≈0) from a gate-drift tail
+    // (large deadBand — the level sagged and the recording itself lacks the
+    // audio; tune the gate/gain, not the service).
+    var cov = coverageShortfall(r, recMs);
+    if (cov) {
+      degraded = true;
+      note = (note ? note + " " : "") + cov.message;
+      recordMicFailure("coverage-shortfall",
+        " [rec:" + Math.round(recMs / 1000) + "s" +
+        " speechUntil:" + Math.round(cov.expectedSec) + "s" +
+        " lastWordEnd:" + Math.round(cov.lastEnd) + "s" +
+        " audioDur:" + (typeof r.audioDurationSecs === "number" ? Math.round(r.audioDurationSecs) + "s" : "?") +
+        " gateOpen:" + Math.round(gateOpenMs / 1000) + "s" +
+        " deadBand:" + Math.round(deadBandMs / 1000) + "s" +
+        " blob:" + Math.round(blob.size / 1024) + "KB chunks:" + chunks.length + "]");
+    }
+
     await deliverFinalText(cleanTranscript(latestText), {
       unexpected: unexpected, label: "Transcript", note: note,
       degraded: degraded, unfilteredText: degraded ? r.unfilteredText : "",
@@ -3289,7 +3645,7 @@ right lower quadrant"></textarea>
     // ack: its REC screen must not paint over a relay failure before the
     // failure was ever shown.
     if (joinedSessionCode && cleaned.trim()) {
-      relayDeliveryToDesktop(cleaned, announceRelayOutcome).finally(maybePendingStart);
+      relayDeliveryToDesktop(cleaned, announceRelayOutcome, opts.degraded ? (opts.note || "Verify the transcript.") : "").finally(maybePendingStart);
     } else {
       maybePendingStart();
     }
@@ -3644,7 +4000,7 @@ right lower quadrant"></textarea>
     // Auto-clear: a long-but-bounded window for recording (a missed "stop" must
     // not leave the dot pulsing forever); a tight one for transcribing (the
     // batch upload deadline plus margin) so a missed delivery clears it too.
-    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + 8000) : 600000;
+    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + UPLOAD_TIMEOUT_EXTRA_MAX_MS + 8000) : 600000;
     phoneRecTimer = setTimeout(function () { setPhoneRecIndicator("off"); }, ttl);
   }
 
@@ -3751,6 +4107,9 @@ right lower quadrant"></textarea>
     connectPhoneSessionWs();
     phoneLastPongAt = Date.now();
     if (!phonePingTimer) phonePingTimer = setInterval(phoneHeartbeat, PHONE_PING_INTERVAL_MS);
+    // Poll fallback: a no-op every tick the WS is OPEN; the safety net when it
+    // is not (see pollLatestDeliveries).
+    if (!phonePollTimer) phonePollTimer = setInterval(function () { pollLatestDeliveries(false); }, POLL_LATEST_MS);
     setStatus(statusMsg, "ok");
   }
 
@@ -3789,6 +4148,7 @@ right lower quadrant"></textarea>
       // delivery landed boots with the text still queued — flush it now.
       if (deliveryQueue.length) backgroundFlush();
     }
+    updateQueueChip(); // undelivered notes surface immediately at boot, joined or not
   }
 
   function connectPhoneSessionWs() {
@@ -3840,6 +4200,36 @@ right lower quadrant"></textarea>
     }, phoneReconnectDelayMs);
   }
 
+  // Desktop-presence pill (phone, big-button surface). The phone holds no
+  // socket, so before this it learned the desktop was gone only AFTER a
+  // dictation came back with a zero-listener ack — the note already queued.
+  // Poll the room's /status while visible on the big screen so the clinician
+  // can SEE "desktop not listening" BEFORE speaking. A cue only — it never
+  // gates recording (the queue + manual send catch an offline desktop), and it
+  // hides on any fetch failure or an old worker's 404 so it cannot mislead.
+  async function pollDesktopStatus() {
+    if (!joinedSessionCode || !bigButtonActive()) { setDesktopPill(null); return; }
+    if (document.visibilityState !== "visible") return;
+    try {
+      var res = await fetch("/api/session/" + joinedSessionCode + "/status");
+      if (!res.ok) { setDesktopPill(null); return; }
+      var data = JSON.parse(await res.text());
+      if (!data || typeof data.listeners !== "number") { setDesktopPill(null); return; }
+      setDesktopPill(data.listeners > 0);
+      // Presence detected while notes wait: deliver NOW instead of riding out
+      // the retry backoff — the "desktop just came back" heal.
+      if (data.listeners > 0 && deliveryQueue.length) backgroundFlush();
+    } catch (e) { setDesktopPill(null); }
+  }
+
+  function setDesktopPill(state) {
+    if (!bigDesktopPillEl) return;
+    if (state === null || !joinedSessionCode || !bigButtonActive()) { bigDesktopPillEl.style.display = "none"; return; }
+    bigDesktopPillEl.style.display = "";
+    if (state) { bigDesktopPillEl.textContent = "🖥 Desktop ✓"; bigDesktopPillEl.className = "ok"; }
+    else { bigDesktopPillEl.textContent = "🖥 Desktop not listening"; bigDesktopPillEl.className = "bad"; }
+  }
+
   // Desktop returning to the foreground: the listener socket commonly dies while
   // the tab is backgrounded (browsers freeze background tabs and throttle the
   // heartbeat timer; NAT idle-timeouts kill the socket without firing onclose),
@@ -3860,9 +4250,38 @@ right lower quadrant"></textarea>
     if (!phoneSessionWs) connectPhoneSessionWs();
   }
 
+  // /latest poll fallback (desktop). The WS is the primary delivery path, but
+  // it can be dead while a note waits at the room: background tabs are frozen
+  // (heartbeat + backoff timers throttled) and NAT idle-timeouts kill sockets
+  // without firing onclose. While the socket is not OPEN, sweep the room's
+  // fresh deliveries through the NORMAL message handler — the persisted
+  // delivery_id ring dedupes and this desktop's append ownership applies, so a
+  // poll delivery is indistinguishable from a WS one. Even hidden-tab timer
+  // throttling (~1 tick/min) lands the note within a minute instead of never.
+  // force=true (the foreground sweep) also checks past an OPEN-looking socket:
+  // a zombie can read OPEN for up to PHONE_PONG_TIMEOUT_MS — the sweep is
+  // dedupe-safe, so checking is free. Fully best-effort: the WS reconnect
+  // machinery stays the loud path.
+  async function pollLatestDeliveries(force) {
+    if (!phoneSessionCode) return;
+    if (!force && phoneSessionWs && phoneSessionWs.readyState === 1) return;
+    try {
+      var res = await fetch("/api/session/" + phoneSessionCode + "/latest");
+      if (!res.ok) return;
+      var data = JSON.parse(await res.text());
+      // New workers return the full fresh ring; an old worker only the newest.
+      var list = Array.isArray(data.deliveries) ? data.deliveries : (data.delivery ? [data.delivery] : []);
+      for (var i = 0; i < list.length; i++) {
+        var d = list[i];
+        if (d && d.message_type === "phone_delivery") handlePhoneSessionMessage(d);
+      }
+    } catch (e) {}
+  }
+
   function stopPhoneSession() {
     phoneSessionCode = ""; // cleared first so the onclose below does not reconnect
     if (phonePingTimer)      { clearInterval(phonePingTimer); phonePingTimer = null; }
+    if (phonePollTimer)      { clearInterval(phonePollTimer); phonePollTimer = null; }
     if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
     if (phoneFallbackTimer)  { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
     if (phoneSessionWs) {
@@ -4059,6 +4478,12 @@ right lower quadrant"></textarea>
       id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
       text: text,
       ts: Date.now(),
+      // Code-bound: the item may only ever auto-deliver to the desktop it was
+      // dictated FOR. Leave/rejoin no longer wipe the queue (that destroyed
+      // undelivered patient text — the field incident this fixes); instead the
+      // flush skips items whose code differs, so a note can never auto-paste
+      // onto a different clinic's desktop.
+      code: joinedSessionCode,
     };
     deliveryQueue.push(item);
     // An unbounded retry buffer is its own failure mode: drop the OLDEST
@@ -4066,6 +4491,7 @@ right lower quadrant"></textarea>
     // item is at the tail, so it is never the one dropped.
     while (deliveryQueue.length > DELIVERY_QUEUE_MAX) deliveryQueue.shift();
     saveSettingsNow();
+    updateQueueChip();
     return item;
   }
 
@@ -4075,9 +4501,10 @@ right lower quadrant"></textarea>
     var before = deliveryQueue.length;
     // A delivery too old to land safely (the user has moved on) must NOT auto-
     // paste onto a chart hours later — drop it from the retry queue. It remains
-    // in history, and the original failure was already announced loud.
+    // in history, and the original failure was already announced loud. Applies
+    // to items bound to another code too (they age out the same way).
     deliveryQueue = deliveryQueue.filter(function (it) { return now - it.ts < DELIVERY_QUEUE_TTL_MS; });
-    if (deliveryQueue.length !== before) saveSettingsNow();
+    if (deliveryQueue.length !== before) { saveSettingsNow(); updateQueueChip(); }
   }
 
   function scheduleDeliveryRetry() {
@@ -4094,14 +4521,18 @@ right lower quadrant"></textarea>
   //   "buffered"  — POST ok but zero listeners (room holds it; keep + retry)
   //   "failed"    — POST error/timeout (link down; keep + stop this round)
   async function postDelivery(item) {
-    if (!joinedSessionCode) return "failed";
+    // POST to the code the item was BOUND to at enqueue (doFlush only posts
+    // items matching the current join, so these agree; the fallback covers a
+    // legacy item that somehow lost its stamp).
+    var code = item.code || joinedSessionCode;
+    if (!code) return "failed";
     var payload = JSON.stringify({ message_type: "phone_delivery", text: item.text, delivery_id: item.id });
     // A black-holed POST must still produce an outcome: without a deadline a
     // hung relay reports nothing at all (and would stall a queued session).
     var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     var killer = ctrl ? setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, RELAY_TIMEOUT_MS) : null;
     try {
-      var res = await fetch("/api/session/" + joinedSessionCode + "/deliver", {
+      var res = await fetch("/api/session/" + code + "/deliver", {
         method: "POST",
         body: payload,
         headers: { "Content-Type": "application/json" },
@@ -4135,26 +4566,39 @@ right lower quadrant"></textarea>
     // flush (a new dictation racing a background retry) is left for its own
     // chained flush, so the dictation that enqueued it always learns its own
     // outcome — and FIFO order is preserved.
+    // Items bound to a DIFFERENT code are SKIPPED, never auto-POSTed (stale
+    // text must not land on the wrong desktop's chart — the safety the old
+    // Leave/switch wipes provided, without destroying the text). They stay
+    // queued for a same-code rejoin, the TTL prune, or a manual send.
     var snapshot = deliveryQueue.map(function (it) { return it.id; });
     var blocked = "";          // the result that stopped the round (buffered/failed)
     var reachedCurrent = false;
-    while (deliveryQueue.length) {
-      var item = deliveryQueue[0];
+    var i = 0;
+    while (i < deliveryQueue.length) {
+      var item = deliveryQueue[i];
       if (snapshot.indexOf(item.id) === -1) break; // enqueued after this flush began
+      if (item.code !== joinedSessionCode) { i++; continue; } // another desktop's item: keep, skip
       var isCurrent = Boolean(opts.currentId && item.id === opts.currentId);
       var result = await postDelivery(item);
       if (result === "delivered") {
         if (isCurrent) reachedCurrent = true;
-        deliveryQueue.shift(); // index 0 is still this item (flushChain serializes mutation)
+        // Remove by identity — the splice keeps foreign-code items ahead of us
+        // intact (flushChain serializes mutation, so the index is still valid).
+        var idx = deliveryQueue.indexOf(item);
+        if (idx !== -1) deliveryQueue.splice(idx, 1);
         saveSettingsNow();
         deliveryRetryDelayMs = 0;
       } else {
         blocked = result;            // buffered or failed
         if (isCurrent) reachedCurrent = true;
-        break;                       // head-of-line: nothing behind it can land either
+        break;                       // head-of-line among this code's items: nothing behind can land either
       }
     }
-    if (deliveryQueue.length) scheduleDeliveryRetry();
+    updateQueueChip();
+    // Re-arm the backoff only when something here can actually be retried —
+    // a queue holding only another desktop's items would spin a no-op timer.
+    var hasCurrentCode = deliveryQueue.some(function (it) { return it.code === joinedSessionCode; });
+    if (hasCurrentCode) scheduleDeliveryRetry();
     if (!opts.currentId) return "";
     // current delivered ⇒ "delivered"; current itself blocked ⇒ that result;
     // an EARLIER item blocked (current never reached) ⇒ current is behind a
@@ -4177,12 +4621,68 @@ right lower quadrant"></textarea>
     }
   }
 
+  // Manual "Send to desktop": push EXISTING text (the box, a history row, the
+  // big-peek note) to the joined desktop through the SAME queue→flush→cue path
+  // as a live dictation — the universal recovery for a note stranded by a link
+  // outage, including one that outlived the queue TTL or is bound to an old
+  // code (history keeps the text; this enqueues a fresh delivery under the
+  // CURRENT code). Idle-only so its cue can never collide with a live
+  // session's single outcome beep. A fresh delivery_id is deliberate: an
+  // explicit re-send SHOULD deliver again — the desktop dedupe ring only
+  // blocks unintentional replays (and the desktop's append mode applies, as
+  // with any delivery).
+  function sendTextToDesktop(text) {
+    if (!joinedSessionCode) return;
+    if (recording || stopping || finishing) return;
+    var t = cleanTranscript(String(text || ""));
+    if (!t.trim()) return;
+    setStatus("Sending to the desktop…", "warn");
+    relayDeliveryToDesktop(t, true);
+  }
+
+  // Undelivered notes must be VISIBLE, never just silently retried: a tappable
+  // chip on both layouts shows the queue depth, split by whether items target
+  // the CURRENT desktop (auto-retrying) or a different one (inert until a
+  // same-code rejoin / manual send / TTL).
+  function updateQueueChip() {
+    var mine = 0, foreign = 0;
+    for (var i = 0; i < deliveryQueue.length; i++) {
+      if (joinedSessionCode && deliveryQueue[i].code === joinedSessionCode) mine++;
+      else foreign++;
+    }
+    var label = "";
+    if (mine) {
+      label = "⏳ " + mine + " note" + (mine === 1 ? "" : "s") + " waiting to send — tap to retry now";
+      if (foreign) label += " (+" + foreign + " for another desktop)";
+    } else if (foreign) {
+      label = "⏳ " + foreign + " undelivered note" + (foreign === 1 ? "" : "s") + " for another desktop — rejoin that code, or send from History";
+    }
+    var els = [queueChipEl, bigQueueChipEl];
+    for (var j = 0; j < els.length; j++) {
+      var el = els[j];
+      if (!el) continue;
+      if (!label) { el.style.display = "none"; continue; }
+      el.style.display = "";
+      el.textContent = label;
+    }
+  }
+
+  function queueChipTapped() {
+    if (!deliveryQueue.length) return;
+    if (!joinedSessionCode) {
+      setStatus("Join the desktop's code first — queued notes deliver once joined (or use 'Send to desktop' in History).", "warn");
+      return;
+    }
+    setStatus("Retrying queued deliveries…", "warn");
+    backgroundFlush();
+  }
+
   // Phone side: relay the final text to the desktop via the durable queue.
   // Exactly one outcome cue for THIS dictation (one beep per session preserved):
   // the queue flush returns this item's fate and we translate it here.
   // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
   // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
-  async function relayDeliveryToDesktop(text, announceOutcome) {
+  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote) {
     var item = enqueueDelivery(text); // durable BEFORE the network call: a phone that dies now recovers at boot
     var outcome = await flushDeliveryQueue({ currentId: item.id });
     // announceOutcome FALSE ⇒ an unexpected/mic-alarm joined dictation:
@@ -4191,6 +4691,14 @@ right lower quadrant"></textarea>
     // cue (the one-outcome-beep-per-session invariant).
     if (!announceOutcome) return;
     if (outcome === "delivered") {
+      if (degradedNote) {
+        // Degraded content (large speaker-filter cut / coverage shortfall): the
+        // relay landed, but the text needs verification — a degraded outcome
+        // gets warnBeep, never doneBeep, even when the delivery leg succeeded.
+        setStatus("Delivered to the desktop clipboard — VERIFY it there. " + degradedNote, "warn");
+        warnBeep();
+        return;
+      }
       // The deferred outcome cue: the desktop received it — the success moment.
       setStatus("Delivered to the desktop clipboard. Done!", "ok");
       doneBeep();
@@ -4229,6 +4737,19 @@ right lower quadrant"></textarea>
     // leave unless a dictation is still mid-flight and wants it (wakeLockDesired).
     if (active) acquireWakeLock();
     else if (!wakeLockDesired()) releaseWakeLock();
+    // Idle mic-health sampling runs only while this surface is up (it exists for
+    // the between-takes iOS corpse); off it, clear the timer + pill.
+    if (active && !micIdleTimer) micIdleTimer = setInterval(micIdleSample, MIC_IDLE_PROBE_MS);
+    if (!active && micIdleTimer) { clearInterval(micIdleTimer); micIdleTimer = null; micIdleDeadFrames = 0; setBigMicPill(""); }
+    // Desktop-presence polling: joined big-button surface only; immediate first
+    // poll so the pill is honest the moment the layout appears.
+    if (active && joinedSessionCode && !statusPollTimer) {
+      statusPollTimer = setInterval(pollDesktopStatus, STATUS_POLL_MS);
+      pollDesktopStatus();
+    }
+    if ((!active || !joinedSessionCode) && statusPollTimer) {
+      clearInterval(statusPollTimer); statusPollTimer = null; setDesktopPill(null);
+    }
     if (!active) {
       document.body.classList.remove("bigbtn-settings");
       bigPeekExpanded = false;
@@ -4239,6 +4760,7 @@ right lower quadrant"></textarea>
         : "Not joined — dictating to this device";
     }
     if (bigLeaveBtnEl) bigLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
+    updateQueueChip(); // the big-layout chip needs a paint when the surface flips
     updateBigScreen();
     maybeAutoShowMicTips(); // first time on the phone surface: nudge about other-voice rejection
   }
@@ -4305,6 +4827,13 @@ right lower quadrant"></textarea>
         ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
         : "Latest transcript — tap to expand";
     if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
+    // Manual re-send from the phone surface (the overlay covers the normal
+    // card, so the expanded peek is where the note is reachable): joined +
+    // idle + something to send.
+    if (bigSendBtnEl) {
+      bigSendBtnEl.style.display =
+        (bigPeekExpanded && joinedSessionCode && latestText && !recording && !stopping && !finishing) ? "" : "none";
+    }
   }
 
   // Press/release handling. Pointer capture plus the cancel/lost/document
@@ -4373,6 +4902,10 @@ right lower quadrant"></textarea>
     // one-shot rules live in exactly one place (the box click now edits, not arms).
     toggleAppendArm();
   });
+  if (bigSendBtnEl) bigSendBtnEl.onclick = () => sendTextToDesktop(latestText);
+  if (sendDesktopBtn) sendDesktopBtn.onclick = () => sendTextToDesktop(latestText);
+  if (queueChipEl) queueChipEl.onclick = () => queueChipTapped();
+  if (bigQueueChipEl) bigQueueChipEl.onclick = () => queueChipTapped();
 
   if (bigLeaveBtnEl) bigLeaveBtnEl.onclick = () => { if (phoneLeaveBtnEl) phoneLeaveBtnEl.click(); };
   if (bigSettingsBtnEl) bigSettingsBtnEl.onclick = () => setBigSettingsVisible(true);
@@ -4515,10 +5048,12 @@ right lower quadrant"></textarea>
     var code = (phoneJoinInputEl ? phoneJoinInputEl.value : "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
     if (code !== joinedSessionCode) {
-      // Switching to a different desktop: queued deliveries target the OLD code
-      // and must never misdeliver to the new one (stale text on the wrong
-      // chart). Drop them (still in history) and start the backoff over.
-      deliveryQueue = [];
+      // Switching to a different desktop: queued deliveries stay CODE-BOUND
+      // (doFlush never auto-POSTs them to this new code — stale text must not
+      // land on the wrong chart) but are KEPT: wiping them here destroyed
+      // undelivered patient text when a clinician re-linked (the field
+      // incident). They flush on a same-code rejoin, age out via the TTL, or
+      // go manually via "Send to desktop". Only the backoff restarts.
       if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
       deliveryRetryDelayMs = 0;
     }
@@ -4528,7 +5063,13 @@ right lower quadrant"></textarea>
     saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
     notifyDesktopOfJoin(code); // close the desktop's pairing QR overlay right away
     applyBigButtonUI(); // joining flips this device into the big-button layout
+    updateQueueChip();
+    updateAppendChip(); // the manual "Send to desktop" button appears when joined
+    renderHistory();    // history rows gain their per-row send buttons
     setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
+    // The self-heal moment for a stranded note: (re)joining the code its items
+    // are bound to flushes them right away — no waiting on the backoff timer.
+    if (deliveryQueue.length) backgroundFlush();
   };
   if (pairPhoneBtnEl) pairPhoneBtnEl.onclick = () => openPairOverlay();
   if (pairDoneBtnEl)  pairDoneBtnEl.onclick  = () => closePairOverlay();
@@ -4542,16 +5083,22 @@ right lower quadrant"></textarea>
 
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
     joinedSessionCode = "";
-    // Abandon any deliveries queued for the code we left (they target that
-    // code and can never be acked now; the text stays in this device's history).
-    deliveryQueue = [];
+    // Queued deliveries are KEPT (code-bound, so they can never misdeliver):
+    // re-linking passes through Leave, and the old wipe here destroyed the
+    // undelivered note the clinician was trying to recover. They flush on a
+    // same-code rejoin, age out via the TTL prune, or go via "Send to desktop"
+    // from History. Only the retry timer/backoff stop (nothing to POST to).
     if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
     deliveryRetryDelayMs = 0; // a fresh join must start the retry backoff over (cf. phoneReconnectDelayMs)
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
     phoneLeaveBtnEl.style.display = "none";
     saveSettingsNow();
     applyBigButtonUI(); // leaving reverts to the normal layout (unless the override is "always")
-    setStatus("Left the desktop session — dictations stay on this device now.", "ok");
+    updateQueueChip();
+    updateAppendChip(); // hide the manual "Send to desktop" button
+    renderHistory();    // drop the per-row send buttons
+    setStatus("Left the desktop session — dictations stay on this device now." +
+      (deliveryQueue.length ? " " + deliveryQueue.length + " undelivered note" + (deliveryQueue.length === 1 ? " is" : "s are") + " kept — rejoin that code to deliver, or send from History." : ""), "ok");
   };
 
   // "Append next" arms a one-shot: the next dictation is added onto the current
@@ -4819,6 +5366,8 @@ right lower quadrant"></textarea>
     }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
     reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden, so deliveries land
+    pollLatestDeliveries(true); // desktop: sweep the room NOW — a zombie socket can look OPEN for up to the pong timeout; the sweep is dedupe-safe
+    pollDesktopStatus(); // phone: refresh the desktop-presence pill the moment the surface is looked at
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
@@ -4831,6 +5380,8 @@ right lower quadrant"></textarea>
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
     reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden
+    pollLatestDeliveries(true); // desktop: dedupe-safe sweep past a possibly-zombie socket
+    pollDesktopStatus(); // phone: refresh the presence pill on app-switch return
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });
