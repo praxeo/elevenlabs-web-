@@ -868,12 +868,18 @@ right lower quadrant"></textarea>
               Tag audio events ((laughter), (cough), …) — batch transcription only
             </label>
 
-            <label for="timestamps">Timestamps</label>
-            <select id="timestamps">
-              <option value="none" selected>none</option>
-              <option value="word">word</option>
-              <option value="character">character</option>
-            </select>
+            <!-- Retired: word timestamps are now ALWAYS requested (the
+                 transcript-coverage guard needs per-word end times on every
+                 dictation). Hidden, not removed, so the persisted "timestamps"
+                 settings field keeps round-tripping (sonioxKey precedent). -->
+            <div style="display:none">
+              <label for="timestamps">Timestamps</label>
+              <select id="timestamps">
+                <option value="none" selected>none</option>
+                <option value="word">word</option>
+                <option value="character">character</option>
+              </select>
+            </div>
           </div>
 
           <h3>How do these settings work?</h3>
@@ -1161,8 +1167,19 @@ right lower quadrant"></textarea>
   let pendingStartTimer = null; // armed deferred start from maybePendingStart; cancellable until it fires
   let lastWsError = "";
   let recStartedAt = 0;
+  let recEndedAt = 0;        // stamped at finalize entry; recEndedAt - recStartedAt = take length
   let speechDetected = false;
   let maxRmsSeen = 0;
+  // Coverage bookkeeping (30 ms gate-loop granularity). The truncation guard
+  // baselines on the LAST gate-open moment — never wall-clock hold time — so a
+  // clinician who keeps the button pressed after finishing a sentence is not
+  // told the transcript is incomplete. deadBandMs is diagnostics-only: a tail of
+  // gate-closed-but-nonsilent audio is the signature of mic-level drift (the
+  // gate silencing real speech), but warning on it would false-positive on
+  // ordinary ambient noise floors.
+  let gateOpenMs = 0;        // ms the gate spent open this take
+  let lastGateOpenAtMs = 0;  // wall-clock ms when the gate was last open
+  let deadBandMs = 0;        // ms gate-closed with RMS in [FLATLINE_RMS, gateOpen)
   let micAlarmFired = false;
   let mutedSince = 0;
   let ctxNotRunningSince = 0; // ms the AudioContext has been non-"running" mid-dictation; debounces the interruption alarm so a transient iOS blip doesn't fail a healthy take
@@ -1294,7 +1311,21 @@ right lower quadrant"></textarea>
   const DIARIZE_PRIMARY_MIN_SHARE = 0.6;  // dominant speaker must hold ≥60% of words to filter at all
   const DIARIZE_WARN_SHARE        = 0.15; // dropping ≥15% of words is degraded, not a clean "Done!"
 
-  const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
+  const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline FLOOR fails fast on a hung request (was 30s); long takes extend it via batchUploadTimeoutMs
+  // The transcription deadline scales with the take length: a flat 15 s starves
+  // a multi-minute upload+transcription that is SUCCEEDING (a real failure mode
+  // in the field), while a hung request still dies loudly — just later. Capped
+  // so a black-holed POST can never stall a session past ~75 s.
+  const UPLOAD_TIMEOUT_REC_FRAC     = 0.25;  // extra deadline per recorded second
+  const UPLOAD_TIMEOUT_EXTRA_MAX_MS = 60000; // cap on that extra (floor + cap = 75 s worst case; hotkey.ahk CLIP_TIMEOUT must cover it)
+
+  // Transcript-coverage guard: a batch result whose last word ends well short of
+  // the speech the gate observed (or whose decoded audio is far shorter than the
+  // recording) is DEGRADED — warn + verify, never a clean "Done!". The slack
+  // absorbs trailing-silence PTT habits and normal pauses; the fraction
+  // dominates on long takes so proportionally small tails never false-warn.
+  const COVERAGE_MIN_SLACK_S = 20;   // absolute slack floor (seconds)
+  const COVERAGE_SLACK_FRAC  = 0.25; // fractional slack (of the recorded length)
 
   // Phone link (desktop listener <-> session room)
   const PHONE_PING_INTERVAL_MS  = 25000; // heartbeat cadence on the listener socket
@@ -1956,7 +1987,7 @@ right lower quadrant"></textarea>
      no-ops if IndexedDB is missing or fails, so a journal problem never touches
      the live capture/upload path — it can only ever NARROW the loss window. */
   const JOURNAL_DB_NAME   = "scribe_v2_journal";
-  const JOURNAL_MAX_CHUNKS = 600; // soft cap (~10 min @ 1s timeslice) — bound the write cost; the in-memory path is unaffected past this
+  const JOURNAL_MAX_CHUNKS = 1800; // soft cap (~30 min @ 1s timeslice ≈ 14 MB IDB) — bound the write cost; the in-memory path is unaffected past this; a capped recovery SAYS so (showJournalRecover)
   let journalDb = null;
   let journalDisabled = (typeof indexedDB === "undefined");
   let journalSessionId = null;   // id of the in-flight take's journal record (null = not journaling)
@@ -2065,16 +2096,20 @@ right lower quadrant"></textarea>
       const blob = bufs.length ? new Blob(bufs, { type: newest.mimeType || "audio/webm" }) : null;
       if (!blob || blob.size < 1024) { try { await journalClear(newest.id); } catch (e) {} return; }
       pendingRecovery = { session: newest, blob: blob };
-      showJournalRecover(newest);
+      // At the cap the journal stopped mirroring mid-take: the recovery is real
+      // but PARTIAL — the banner must say so (a silently half-recovered note is
+      // the same wrong-text failure the journal exists to prevent).
+      showJournalRecover(newest, bufs.length >= JOURNAL_MAX_CHUNKS);
     } catch (e) {}
   }
 
-  function showJournalRecover(session) {
+  function showJournalRecover(session, capped) {
     if (!journalRecoverEl) return;
     let when = "";
     try { when = new Date(session.createdAt).toLocaleString(); } catch (e) {}
     if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
-      "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it.";
+      "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it." +
+      (capped ? " NOTE: only about the first " + Math.round(JOURNAL_MAX_CHUNKS / 60) + " minutes of audio were saved — the recovered text will be incomplete." : "");
     journalRecoverEl.style.display = "";
     warnBeep(); // loud: an un-recovered dictation is a potentially lost note
   }
@@ -2093,7 +2128,9 @@ right lower quadrant"></textarea>
     if (journalRecoverBtn) journalRecoverBtn.disabled = true;
     setStatus("Recovering the interrupted dictation — uploading its audio…", "warn");
     const fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
-    const r = await batchTranscribe(rec.blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+    // Duration estimated from size (64 kbps ⇒ 8 bytes/ms): a long recovered take
+    // needs the same extended transcription deadline as a live one.
+    const r = await batchTranscribe(rec.blob, fileName, batchUploadTimeoutMs(rec.blob.size / 8));
     if (journalRecoverBtn) journalRecoverBtn.disabled = false;
     if (!r.ok || !r.text || !r.text.trim()) {
       setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try Recover again.", "err");
@@ -2337,7 +2374,11 @@ right lower quadrant"></textarea>
     if (SHARED_MODE) form.append("passphrase", passphraseEl.value.trim());
     form.append("file", blob, fileName);
     form.append("file_format", "other");
-    form.append("timestamps_granularity", timestampsEl.value);
+    // Always request word timestamps: the transcript-coverage guard needs per-
+    // word end times on EVERY dictation to catch a silently truncated result
+    // (the old Advanced select defaulted to "none", which left the client blind
+    // to a half-length transcript — it is retired/hidden, not removed).
+    form.append("timestamps_granularity", "word");
     form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
     form.append("tag_audio_events", String(tagEventsEl.checked));
     form.append("diarize", String(diarizeActive())); // keep-primary-speaker: drop bystander voices — phone/big-button surface only
@@ -2369,13 +2410,20 @@ right lower quadrant"></textarea>
       var removedWords = 0;
       var removedShare = 0;
       var unfilteredText = "";
+      // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
+      // measures what the service transcribed, not what the filter kept) and the
+      // decoded audio duration. Both null when absent so the guard can only ever
+      // no-op on missing data, never false-warn.
+      var words = (Array.isArray(data.words) && data.words.length) ? data.words : null;
+      var audioDurationSecs = (typeof data.audio_duration_secs === "number" && isFinite(data.audio_duration_secs))
+        ? data.audio_duration_secs : null;
       // Keep only the primary speaker when diarization is active. A failure to find
       // a clear-minority second speaker (or any words[]) leaves the full text
       // untouched — the filter can only ever REMOVE a clear bystander, never empty
       // a clean note. When it does cut, keep the unfiltered text so a wrongly
       // dropped clinician utterance is recoverable from history.
-      if (diarizeActive() && Array.isArray(data.words) && data.words.length) {
-        var prim = keepPrimarySpeaker(data.words);
+      if (diarizeActive() && words) {
+        var prim = keepPrimarySpeaker(words);
         if (prim && prim.text.trim() && prim.removedWords > 0) {
           unfilteredText = text;
           text = prim.text;
@@ -2383,7 +2431,7 @@ right lower quadrant"></textarea>
           removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
         }
       }
-      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText };
+      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs };
     } catch (err) {
       const aborted = err && err.name === "AbortError";
       return {
@@ -2466,8 +2514,8 @@ right lower quadrant"></textarea>
   // per-device ring (so the root cause can be inspected later, not just glimpsed
   // on a red screen) and console.warn it. Returns the diag string so the caller
   // can also append it to the visible status — one micDiag() call, two sinks.
-  function recordMicFailure(reason) {
-    var diag = micDiag();
+  function recordMicFailure(reason, extraDiag) {
+    var diag = micDiag() + (extraDiag || "");
     try {
       var log = JSON.parse(localStorage.getItem(MICFAIL_LOG_KEY) || "[]");
       if (!Array.isArray(log)) log = [];
@@ -2716,6 +2764,14 @@ right lower quadrant"></textarea>
         if (rms > maxRmsSeen) maxRmsSeen = rms;
         if (rms > openT) speechDetected = true;
 
+        // Coverage bookkeeping for the truncation guard (gateIsOpen was updated
+        // just above, so this tick's state is current). Dead-band time — signal
+        // present but below the gate while it is closed — is the gate-drift
+        // signature (recorded as silence though the clinician kept talking);
+        // logged for diagnosis, never used to warn.
+        if (gateIsOpen) { gateOpenMs += 30; lastGateOpenAtMs = nowMs; }
+        else if (rms >= FLATLINE_RMS && rms < openT) deadBandMs += 30;
+
         const track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
         const trackDead = !track || track.readyState !== "live";
         if (track && track.muted) {
@@ -2916,8 +2972,12 @@ right lower quadrant"></textarea>
     stopPhase = null;
     lastWsError = "";
     recStartedAt = Date.now();
+    recEndedAt = 0;
     speechDetected = false;
     maxRmsSeen = 0;
+    gateOpenMs = 0;
+    lastGateOpenAtMs = 0;
+    deadBandMs = 0;
     micAlarmFired = false;
     mutedSince = 0;
     ctxNotRunningSince = 0;
@@ -3037,6 +3097,7 @@ right lower quadrant"></textarea>
   async function finalizeSession(unexpected) {
     if (sessionFinalized) return;
     sessionFinalized = true;
+    recEndedAt = Date.now(); // take length for the coverage guard + the duration-aware upload deadline
     clearSessionTimers();
     showRecFeedback(false); // recording is over; the status line carries the upload state
 
@@ -3084,6 +3145,59 @@ right lower quadrant"></textarea>
     await finishBatchSession(unexpected);
   }
 
+  // Upload deadline for a take of recMs: floor + a duration-proportional extra,
+  // capped. Also used for the journal recovery re-upload (duration estimated
+  // from the blob size at 64 kbps = 8 bytes/ms).
+  function batchUploadTimeoutMs(recMs) {
+    var extra = Math.min(UPLOAD_TIMEOUT_EXTRA_MAX_MS, Math.round(Math.max(0, recMs || 0) * UPLOAD_TIMEOUT_REC_FRAC));
+    return BATCH_UPLOAD_TIMEOUT_MS + extra;
+  }
+
+  function fmtMinSec(sec) {
+    var s = Math.max(0, Math.round(Number(sec) || 0));
+    var r = s % 60;
+    return Math.floor(s / 60) + ":" + (r < 10 ? "0" : "") + r;
+  }
+
+  // Transcript-coverage guard. Returns null (no concern) or { message,
+  // expectedSec, lastEnd } when the result stops well short of the speech the
+  // gate observed: the transcript's last word ends much earlier than the last
+  // gate-open moment (service dropped a tail the audio contains), or the
+  // service decoded far less audio than was recorded (upload/decode
+  // truncation). Baselined on the LAST GATE-OPEN moment — never the wall-clock
+  // hold — so a clinician who keeps the button pressed after finishing must
+  // not be told the transcript is incomplete. Null-safe on missing
+  // words[]/timestamps/duration: absent data can only mean "no warning",
+  // never a false one.
+  function coverageShortfall(r, recMs) {
+    try {
+      if (!recMs || recMs <= 0) return null;
+      var recSec = recMs / 1000;
+      var expectedSec = recSec;
+      if (lastGateOpenAtMs > recStartedAt) {
+        expectedSec = Math.min(recSec, (lastGateOpenAtMs - recStartedAt) / 1000);
+      }
+      var slack = Math.max(COVERAGE_MIN_SLACK_S, COVERAGE_SLACK_FRAC * recSec);
+      var lastEnd = 0;
+      if (Array.isArray(r.words)) {
+        for (var i = 0; i < r.words.length; i++) {
+          var w = r.words[i];
+          if (w && typeof w.end === "number" && isFinite(w.end) && w.end > lastEnd) lastEnd = w.end;
+        }
+      }
+      var transcriptShort = lastEnd > 0 && expectedSec - lastEnd > slack;
+      var decodedShort = typeof r.audioDurationSecs === "number" && recSec - r.audioDurationSecs > slack;
+      if (!transcriptShort && !decodedShort) return null;
+      var coveredSec = transcriptShort ? lastEnd : r.audioDurationSecs;
+      return {
+        message: "⚠ Transcript may be INCOMPLETE — covered " + fmtMinSec(coveredSec) +
+                 " of " + fmtMinSec(expectedSec) + " of speech recorded. VERIFY the end of the note!",
+        expectedSec: expectedSec,
+        lastEnd: lastEnd,
+      };
+    } catch (e) { return null; }
+  }
+
   // Pure batch delivery: upload the post-gate recording, splice the result
   // onto the note base, and hand off to the shared delivery exit.
   async function finishBatchSession(unexpected) {
@@ -3118,7 +3232,8 @@ right lower quadrant"></textarea>
     setLinkPill("uploading");
     setStatus("Uploading audio for transcription…", "warn");
 
-    const r = await batchTranscribe(blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+    const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
+    const r = await batchTranscribe(blob, fileName, batchUploadTimeoutMs(recMs));
 
     if (!r.ok) {
       lastWsError = r.error || "upload failed"; // surfaces in the failure status line
@@ -3152,6 +3267,27 @@ right lower quadrant"></textarea>
       ? ("Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers." +
          (degraded ? " VERIFY nothing of yours was dropped — the unfiltered version is saved in history." : ""))
       : "";
+
+    // Coverage guard: a partial result must never read as a clean "Done!". The
+    // text is still delivered (it is real, just possibly incomplete); the diag
+    // ring gets the full picture so the next field report can tell a service
+    // truncation (gate open to the end, deadBand≈0) from a gate-drift tail
+    // (large deadBand — the level sagged and the recording itself lacks the
+    // audio; tune the gate/gain, not the service).
+    var cov = coverageShortfall(r, recMs);
+    if (cov) {
+      degraded = true;
+      note = (note ? note + " " : "") + cov.message;
+      recordMicFailure("coverage-shortfall",
+        " [rec:" + Math.round(recMs / 1000) + "s" +
+        " speechUntil:" + Math.round(cov.expectedSec) + "s" +
+        " lastWordEnd:" + Math.round(cov.lastEnd) + "s" +
+        " audioDur:" + (typeof r.audioDurationSecs === "number" ? Math.round(r.audioDurationSecs) + "s" : "?") +
+        " gateOpen:" + Math.round(gateOpenMs / 1000) + "s" +
+        " deadBand:" + Math.round(deadBandMs / 1000) + "s" +
+        " blob:" + Math.round(blob.size / 1024) + "KB chunks:" + chunks.length + "]");
+    }
+
     await deliverFinalText(cleanTranscript(latestText), {
       unexpected: unexpected, label: "Transcript", note: note,
       degraded: degraded, unfilteredText: degraded ? r.unfilteredText : "",
@@ -3289,7 +3425,7 @@ right lower quadrant"></textarea>
     // ack: its REC screen must not paint over a relay failure before the
     // failure was ever shown.
     if (joinedSessionCode && cleaned.trim()) {
-      relayDeliveryToDesktop(cleaned, announceRelayOutcome).finally(maybePendingStart);
+      relayDeliveryToDesktop(cleaned, announceRelayOutcome, opts.degraded ? (opts.note || "Verify the transcript.") : "").finally(maybePendingStart);
     } else {
       maybePendingStart();
     }
@@ -3644,7 +3780,7 @@ right lower quadrant"></textarea>
     // Auto-clear: a long-but-bounded window for recording (a missed "stop" must
     // not leave the dot pulsing forever); a tight one for transcribing (the
     // batch upload deadline plus margin) so a missed delivery clears it too.
-    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + 8000) : 600000;
+    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + UPLOAD_TIMEOUT_EXTRA_MAX_MS + 8000) : 600000;
     phoneRecTimer = setTimeout(function () { setPhoneRecIndicator("off"); }, ttl);
   }
 
@@ -4182,7 +4318,7 @@ right lower quadrant"></textarea>
   // the queue flush returns this item's fate and we translate it here.
   // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
   // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
-  async function relayDeliveryToDesktop(text, announceOutcome) {
+  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote) {
     var item = enqueueDelivery(text); // durable BEFORE the network call: a phone that dies now recovers at boot
     var outcome = await flushDeliveryQueue({ currentId: item.id });
     // announceOutcome FALSE ⇒ an unexpected/mic-alarm joined dictation:
@@ -4191,6 +4327,14 @@ right lower quadrant"></textarea>
     // cue (the one-outcome-beep-per-session invariant).
     if (!announceOutcome) return;
     if (outcome === "delivered") {
+      if (degradedNote) {
+        // Degraded content (large speaker-filter cut / coverage shortfall): the
+        // relay landed, but the text needs verification — a degraded outcome
+        // gets warnBeep, never doneBeep, even when the delivery leg succeeded.
+        setStatus("Delivered to the desktop clipboard — VERIFY it there. " + degradedNote, "warn");
+        warnBeep();
+        return;
+      }
       // The deferred outcome cue: the desktop received it — the success moment.
       setStatus("Delivered to the desktop clipboard. Done!", "ok");
       doneBeep();

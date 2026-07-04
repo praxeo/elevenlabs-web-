@@ -75,6 +75,18 @@
 //      two-speaker words[] drops the bystander with a no-beep "removed N words"
 //      status note, a single speaker is a no-op, and toggling off sends
 //      diarize=false + skips client filtering + persists per-device
+//  25w. joined + degraded outcome: a large speaker-filter cut delivered over the
+//      relay gets warnBeep + VERIFY on the delivered ack — never doneBeep
+//  39. transcript-coverage guard: a result whose last word ends far short of the
+//      speech the gate observed (or whose decoded audio is far shorter than the
+//      recording) is a degraded WARN (text still delivered + diag ring entry),
+//      a full-coverage take stays a clean Done!, words without timestamps and
+//      absent duration are clean no-ops, and the gate-open baseline kills the
+//      held-but-silent false warn
+//  40. duration-aware upload deadline: a long take's transcription outlives the
+//      old flat 15 s deadline and still succeeds
+//  41. journal cap honesty: a recovery capped at JOURNAL_MAX_CHUNKS says only
+//      the first ~N minutes were saved; an uncapped one doesn't
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -2889,6 +2901,281 @@ console.log('--- scenario 23p: phone corpse-mic probe ---');
   docB.getElementById('recordBtn').click(); // clean up the take
   await sleep(200);
   micRms = 0.05;
+}
+
+// ===== Scenario 25w: joined + degraded outcome — the relay ack must WARN, never doneBeep =====
+// A large speaker-filter cut is a degraded outcome. On a joined phone the relay
+// ack owns the outcome cue — and before this fix a "delivered" ack played the
+// clean doneBeep over degraded content. Now: delivered + degraded ⇒ VERIFY
+// status + warnBeep.
+console.log('--- scenario 25w: joined degraded outcome gets warnBeep on the delivered ack ---');
+{
+  const vibes25w = [];
+  const dom25w = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.vibrate = (p) => { vibes25w.push(p); return true; };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      // Two speakers, 3 of 9 words from a bystander: a LARGE (>=15%) removal ⇒ degraded.
+      const words = ['Assessment', 'and', 'plan', 'continue', 'current', 'medications'].map((t) => ({ text: t, type: 'word', speaker_id: 'speaker_0' }))
+        .concat(['did', 'you', 'eat'].map((t) => ({ text: t, type: 'word', speaker_id: 'speaker_1' })));
+      win.fetch = (url) => {
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ text: 'Assessment and plan continue current medications did you eat', words: words })) });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'JOINW1', micGranted: true }));
+    },
+  });
+  await sleep(180); // boot: persisted join restores -> big-button surface (diarize applies)
+  const doc25w = dom25w.window.document;
+  doc25w.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc25w.getElementById('recordBtn').click();
+  await sleep(140);
+  doc25w.getElementById('recordBtn').click();
+  await sleep(450); // upload -> degraded filter -> relay ack (listeners:1)
+  const st25w = doc25w.getElementById('status');
+  check('s25w: delivered ack on a degraded outcome says VERIFY (not Done!)',
+    st25w.textContent.includes('VERIFY') && !st25w.textContent.includes('Done!'), st25w.textContent);
+  check('s25w: degraded relay status is warn class', st25w.className.includes('warn'), st25w.className);
+  check('s25w: the outcome haptic is the WARN pattern, not done',
+    JSON.stringify(vibes25w[vibes25w.length - 1]) === JSON.stringify([90, 90, 90]), JSON.stringify(vibes25w));
+  check('s25w: the filtered primary text still reached the local clipboard',
+    (dom25w.window._clip || '').includes('Assessment and plan continue current medications') && !(dom25w.window._clip || '').includes('did you eat'),
+    JSON.stringify(dom25w.window._clip));
+}
+
+// ===== Scenario 39: transcript-coverage guard =====
+// The reported failure: a multi-minute dictation came back half-transcribed with
+// a clean "Done!". The guard compares the transcript's last word end-time (and
+// the service's decoded duration) against the speech the gate observed; a big
+// shortfall is a degraded WARN — text still delivered — with a diag ring entry.
+console.log('--- scenario 39: transcript-coverage guard ---');
+{
+  const mk39Dom = (state) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      // Skewable clock: the page's Date.now reads real time + skewMs, so a
+      // "5-minute take" runs in milliseconds of wall time. The AudioContext
+      // clock follows the same skewed time so the gate's hold/close advances.
+      const realNow = Date.now.bind(Date);
+      win.Date.now = () => realNow() + state.skewMs;
+      const t0 = realNow();
+      win.AudioContext = class extends MockAudioCtx {
+        constructor() {
+          super();
+          Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state.skewMs - t0) / 1000, configurable: true });
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = (url, fOpts) => new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(state.body)) }), state.delayMs || 5);
+        if (fOpts && fOpts.signal) fOpts.signal.addEventListener('abort', () => { clearTimeout(t); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true }));
+    },
+  });
+
+  // One simulated take: speak (gate open), optionally go silent, then jump the
+  // clock ~290 s so the take reads as multi-minute, tick once more, and stop.
+  const run39 = async (body, opts) => {
+    const state = { skewMs: 0, body: body, delayMs: (opts && opts.delayMs) || 0 };
+    const dom = mk39Dom(state);
+    await sleep(160); // boot (micGranted warms the graph)
+    const doc39 = dom.window.document;
+    doc39.getElementById('apiKey').value = 'test-key';
+    micRms = 0.05;
+    doc39.getElementById('recordBtn').click();
+    await sleep(150); // gate opens; speech observed
+    if (opts && opts.silenceTail) { micRms = 0.0001; await sleep(100); } // true silence (below FLATLINE_RMS)
+    state.skewMs = 290000;
+    await sleep(150); // ticks under the skewed clock (speech continues, or the gate closes)
+    doc39.getElementById('recordBtn').click(); // stop -> upload
+    await sleep(400 + ((opts && opts.delayMs) || 0));
+    micRms = 0.05;
+    return dom.window;
+  };
+  const w39 = (win, sel) => win.document.getElementById(sel);
+  const wordsUntil = (endSec) => [
+    { text: 'First', type: 'word', start: 0.5, end: 1.2 },
+    { text: 'half', type: 'word', start: 1.3, end: 2.0 },
+    { text: 'only', type: 'word', start: endSec - 1, end: endSec },
+  ];
+
+  // (a) transcript stops at ~60 s of a ~290 s spoken take -> degraded WARN,
+  //     text delivered, coverage-shortfall in the diag ring.
+  const winA = await run39({ text: 'First half only.', words: wordsUntil(60), audio_duration_secs: 290 });
+  const stA = w39(winA, 'status');
+  check('s39a: a half-covered transcript is a WARN, never Done!', stA.className.includes('warn') && !stA.textContent.includes('Done!'), stA.textContent + ' / ' + stA.className);
+  check('s39a: the warn says INCOMPLETE + VERIFY', stA.textContent.includes('INCOMPLETE') && stA.textContent.includes('VERIFY'), stA.textContent);
+  check('s39a: the (possibly partial) text is still delivered', (winA._clip || '').includes('First half only.'), JSON.stringify(winA._clip));
+  const ring39 = JSON.parse(winA.localStorage.getItem('scribe_v2_micfail_v9') || '[]');
+  check('s39a: coverage-shortfall recorded in the diag ring', ring39.length && ring39[0].reason === 'coverage-shortfall', JSON.stringify(ring39[0] || null));
+  check('s39a: the diag carries the coverage numbers', ring39.length && ring39[0].diag.includes('lastWordEnd:60s') && ring39[0].diag.includes('deadBand:'), ring39.length ? ring39[0].diag : 'no entry');
+
+  // (b) full coverage (last word ends near the take end) -> clean Done!.
+  const winB = await run39({ text: 'Full note to the end.', words: wordsUntil(285), audio_duration_secs: 290 });
+  const stB = w39(winB, 'status');
+  check('s39b: full coverage stays a clean Done!', stB.textContent.includes('Done!') && stB.className.includes('ok'), stB.textContent + ' / ' + stB.className);
+
+  // (c) words without timestamps + no duration (older shape / API drift) ->
+  //     the guard no-ops; clean Done!.
+  const winC = await run39({ text: 'No timestamps here.', words: [{ text: 'No', type: 'word' }, { text: 'timestamps', type: 'word' }] });
+  const stC = w39(winC, 'status');
+  check('s39c: missing timestamps/duration is a clean no-op', stC.textContent.includes('Done!') && stC.className.includes('ok'), stC.textContent);
+
+  // (d) no words[] but the service decoded far less audio than recorded ->
+  //     degraded WARN via the duration check.
+  const winD = await run39({ text: 'Decoded a fraction.', audio_duration_secs: 120 });
+  const stD = w39(winD, 'status');
+  check('s39d: a short decoded duration is a WARN', stD.className.includes('warn') && stD.textContent.includes('INCOMPLETE'), stD.textContent + ' / ' + stD.className);
+
+  // (e) the gate-open baseline: speech only in the first moments, then TRUE
+  //     silence while the button stays held ~290 s -> the transcript "ends
+  //     early" against wall-clock but NOT against observed speech -> clean.
+  const winE = await run39({ text: 'Short remark.', words: [{ text: 'Short', type: 'word', start: 0.1, end: 0.4 }, { text: 'remark', type: 'word', start: 0.5, end: 0.9 }], audio_duration_secs: 290 }, { silenceTail: true });
+  const stE = w39(winE, 'status');
+  check('s39e: held-but-silent tail does NOT false-warn (gate baseline)', stE.textContent.includes('Done!') && stE.className.includes('ok'), stE.textContent + ' / ' + stE.className);
+}
+
+// ===== Scenario 40: duration-aware upload deadline =====
+// A ~290 s take extends the transcription deadline to ~75 s; a response that
+// arrives after 16 s (past the old flat 15 s abort) must still succeed.
+console.log('--- scenario 40: duration-aware upload deadline (16 s response on a long take succeeds) ---');
+{
+  const state40 = { skewMs: 0, body: { text: 'Long take transcribed late but fine.', words: [{ text: 'fine', type: 'word', start: 288, end: 289 }], audio_duration_secs: 290 }, delayMs: 16000 };
+  const dom40 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      const realNow = Date.now.bind(Date);
+      win.Date.now = () => realNow() + state40.skewMs;
+      const t0 = realNow();
+      win.AudioContext = class extends MockAudioCtx {
+        constructor() {
+          super();
+          Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state40.skewMs - t0) / 1000, configurable: true });
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = (url, fOpts) => new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(state40.body)) }), state40.delayMs);
+        if (fOpts && fOpts.signal) fOpts.signal.addEventListener('abort', () => { clearTimeout(t); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true }));
+    },
+  });
+  await sleep(160);
+  const doc40 = dom40.window.document;
+  doc40.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc40.getElementById('recordBtn').click();
+  await sleep(150);
+  state40.skewMs = 290000; // the take "lasted" ~290 s -> deadline 15 s + min(60 s, 25%) = 75 s
+  await sleep(150);
+  doc40.getElementById('recordBtn').click(); // stop -> upload; response lands after 16 s REAL time
+  await sleep(17000);
+  const st40 = doc40.getElementById('status');
+  check('s40: a 16 s transcription on a long take succeeds (old flat 15 s would abort)',
+    st40.textContent.includes('Done!') && st40.className.includes('ok'), st40.textContent + ' / ' + st40.className);
+  check('s40: the late text reached the clipboard', (dom40.window._clip || '').includes('Long take transcribed late'), JSON.stringify(dom40.window._clip));
+}
+
+// ===== Scenario 41: journal cap honesty =====
+// A crash-recovery capped at JOURNAL_MAX_CHUNKS is REAL but PARTIAL — the
+// banner must say only the first ~N minutes were saved. An uncapped one must not.
+console.log('--- scenario 41: journal cap honesty ---');
+{
+  const JOURNAL_CAP = 1800; // mirrors JOURNAL_MAX_CHUNKS in worker.js
+  const seedJournal = (idb, chunkCount) => new Promise((resolve, reject) => {
+    const req = idb.open('scribe_v2_journal', 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      db.createObjectStore('sessions', { keyPath: 'id' });
+      const cs = db.createObjectStore('chunks', { keyPath: 'k', autoIncrement: true });
+      cs.createIndex('sid', 'sid', { unique: false });
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction(['sessions', 'chunks'], 'readwrite');
+      tx.objectStore('sessions').put({ id: 'jSEED', createdAt: new Date().toISOString(), mimeType: 'audio/webm', joined: false, base: '', state: 'recording' });
+      for (let i = 0; i < chunkCount; i++) tx.objectStore('chunks').put({ sid: 'jSEED', buf: new ArrayBuffer(1024) });
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => reject(tx.error);
+    };
+    req.onerror = () => reject(req.error);
+  });
+  const mk41Dom = (idb) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.indexedDB = idb;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"recovered"}') });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({}));
+    },
+  });
+
+  // (a) a capped orphan (exactly the cap) -> the banner admits the partial save.
+  const idbCap = new IDBFactory();
+  await seedJournal(idbCap, JOURNAL_CAP);
+  const domCap = mk41Dom(idbCap);
+  await sleep(400); // boot -> restoreJournal
+  const msgCap = domCap.window.document.getElementById('journalRecoverMsg').textContent;
+  const shownCap = domCap.window.document.getElementById('journalRecover').style.display !== 'none';
+  check('s41a: a capped recovery banner shows', shownCap, 'display=' + domCap.window.document.getElementById('journalRecover').style.display);
+  check('s41a: a capped recovery says only the first ~30 minutes were saved', msgCap.includes('first 30 minutes') && msgCap.includes('incomplete'), msgCap);
+
+  // (b) an uncapped orphan -> no partial-save note.
+  const idbOk = new IDBFactory();
+  await seedJournal(idbOk, 3);
+  const domOk = mk41Dom(idbOk);
+  await sleep(400);
+  const msgOk = domOk.window.document.getElementById('journalRecoverMsg').textContent;
+  const shownOk = domOk.window.document.getElementById('journalRecover').style.display !== 'none';
+  check('s41b: an uncapped recovery banner shows', shownOk, 'display=' + domOk.window.document.getElementById('journalRecover').style.display);
+  check('s41b: an uncapped recovery has no partial-save note', !msgOk.includes('first 30 minutes'), msgOk);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

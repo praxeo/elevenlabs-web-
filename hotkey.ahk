@@ -7,7 +7,7 @@ SetKeyDelay(0, 10)
 ; ===== CONFIG =====
 SPINUP         := 80           ; ms before speaking (mic is kept warm by the browser)
 MIN_HOLD       := 350          ; taps shorter than this are discarded
-CLIP_TIMEOUT   := 20           ; backstop; covers hybrid's worst case (tail + final-wait + 8s batch refine ≈ 11s); sentinel makes failures return in ~2s
+CLIP_TIMEOUT   := 90           ; backstop; must cover the duration-aware batch deadline (15s floor + up to 60s extra on a long take ≈ 75s worst case); sentinel makes failures return in ~2s
 ACT_TIMEOUT    := 0.15         ; per-attempt window-activation wait
 ACT_TRIES      := 2
 HOLD_CAP_MS    := 60000        ; absolute max hold before we force-stop (anti-wedge)
