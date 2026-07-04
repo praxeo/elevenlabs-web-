@@ -47,8 +47,11 @@
 //      a fresh delivery_id; the queue chip surfaces undelivered notes and a tap
 //      retries; everything hides when unjoined
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
-//      held-delivery replay inside the window only, transcripts not buffered,
-//      GET /latest for native pollers (fresh delivery vs stale null)
+//      persisted delivery RING (cap 5, oldest dropped) replayed inside the
+//      retention window only, transcripts not buffered, GET /latest for native
+//      pollers (back-compat delivery + additive deliveries[]), GET /status
+//      (listeners + buffered cue), eviction survival via DO storage, and the
+//      cleanup alarm pruning expired text from storage
 //  22. phone link persistence: desktop session + phone join survive reloads
 //      (resume room at boot, replay deduped by the persisted delivery id,
 //      Leave/End forget the stored codes)
@@ -1255,9 +1258,23 @@ console.log('--- scenario 21: session room DO contract ---');
     async text() { return this.body; }
   };
 
-  const room = new worker.SessionRoom({}, {});
+  // Fake DO storage over a shared Map: a SECOND SessionRoom instance over the
+  // same map simulates room eviction + rehydration, and the alarm prune can be
+  // asserted. put() deep-copies so in-memory ts pokes can't alias the "disk".
+  const mem = new Map();
+  let alarmAt = null;
+  const fakeState = () => ({ storage: {
+    get: async (k) => mem.get(k),
+    put: async (k, v) => { mem.set(k, JSON.parse(JSON.stringify(v))); },
+    delete: async (k) => { mem.delete(k); },
+    setAlarm: async (t) => { alarmAt = t; },
+    deleteAlarm: async () => { alarmAt = null; },
+  } });
+
+  const room = new worker.SessionRoom(fakeState(), {});
   const wsReq = () => ({ headers: { get: (h) => (h === 'Upgrade' ? 'websocket' : null) }, method: 'GET', url: 'https://room/api/session/ABC123' });
   const postReq = (body) => ({ headers: { get: () => null }, method: 'POST', url: 'https://room/broadcast', text: async () => body });
+  const isDeliveryFrame = (d) => { try { return JSON.parse(d).message_type === 'phone_delivery'; } catch (e) { return false; } };
 
   await room.fetch(wsReq());
   const listenerA = lastPair.server;
@@ -1277,22 +1294,55 @@ console.log('--- scenario 21: session room DO contract ---');
   const listenerB = lastPair.server;
   check('s21: reconnecting listener gets the held delivery replayed', listenerB.sent.includes(delivery), listenerB.sent.length + ' frames');
 
-  room.lastDelivery.ts -= 3 * 60 * 1000; // age it past the replay window
+  room.deliveries.forEach((d) => { d.ts -= 31 * 60 * 1000; }); // age past the retention window (in memory)
   await room.fetch(wsReq());
   const listenerC = lastPair.server;
   check('s21: stale deliveries are not replayed', !listenerC.sent.includes(delivery), listenerC.sent.length + ' frames');
 
   const ackNonDelivery = JSON.parse(await (await room.fetch(postReq(JSON.stringify({ message_type: 'partial_transcript', text: 'x' })))).text());
-  check('s21: transcript frames are not buffered as deliveries', room.lastDelivery.body === delivery && typeof ackNonDelivery.listeners === 'number');
+  check('s21: transcript frames are not buffered as deliveries', room.deliveries.length && room.deliveries[room.deliveries.length - 1].body === delivery && typeof ackNonDelivery.listeners === 'number');
 
   // GET /latest: native pollers (AHK) read the held delivery without joining
   const latestReq = () => ({ headers: { get: () => null }, method: 'GET', url: 'https://room/api/session/ABC123/latest' });
   const staleLatest = JSON.parse(await (await room.fetch(latestReq())).text());
-  check('s21: /latest returns null for a stale delivery', staleLatest.ok === true && staleLatest.delivery === null, JSON.stringify(staleLatest));
+  check('s21: /latest returns null for a stale delivery', staleLatest.ok === true && staleLatest.delivery === null && Array.isArray(staleLatest.deliveries) && staleLatest.deliveries.length === 0, JSON.stringify(staleLatest));
   const delivery2 = JSON.stringify({ message_type: 'phone_delivery', text: 'DO note 2.', delivery_id: 'do2' });
   await room.fetch(postReq(delivery2));
   const freshLatest = JSON.parse(await (await room.fetch(latestReq())).text());
-  check('s21: /latest returns the held delivery with its id', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
+  check('s21: /latest returns the held delivery with its id (AHK back-compat)', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
+  check('s21: /latest gains the additive deliveries array', Array.isArray(freshLatest.deliveries) && freshLatest.deliveries.length === 1 && freshLatest.deliveries[0].delivery_id === 'do2', JSON.stringify(freshLatest.deliveries));
+  check('s21: a new delivery prunes the aged one from the ring', room.deliveries.length === 1, room.deliveries.length + ' entries');
+
+  // Ring semantics: the ring caps at DELIVERY_RETAIN_MAX (5), oldest dropped,
+  // order oldest->newest — so a reconnect replays a bounded, ordered set the
+  // desktop's 12-id dedupe ring fully covers.
+  for (let i = 3; i <= 7; i++) {
+    await room.fetch(postReq(JSON.stringify({ message_type: 'phone_delivery', text: 'DO note ' + i + '.', delivery_id: 'do' + i })));
+  }
+  const ringLatest = JSON.parse(await (await room.fetch(latestReq())).text());
+  check('s21: the ring caps at 5 (oldest dropped)', ringLatest.deliveries.length === 5 && ringLatest.deliveries[0].delivery_id === 'do3', JSON.stringify(ringLatest.deliveries.map((d) => d.delivery_id)));
+  check('s21: /latest delivery stays the newest', ringLatest.delivery.delivery_id === 'do7', ringLatest.delivery.delivery_id);
+
+  // /status: presence cue for the phone's pill (listeners + buffered count).
+  const statusReq = () => ({ headers: { get: () => null }, method: 'GET', url: 'https://room/api/session/ABC123/status' });
+  const status21 = JSON.parse(await (await room.fetch(statusReq())).text());
+  check('s21: /status reports listeners + buffered', status21.ok === true && status21.listeners === 2 && status21.buffered === 5, JSON.stringify(status21));
+
+  // Eviction survival: a NEW instance over the same storage rehydrates the ring
+  // and replays it to a connecting listener (the old in-memory slot lost
+  // everything here — the silent stranded-note path).
+  const room2 = new worker.SessionRoom(fakeState(), {});
+  await room2.fetch(wsReq());
+  const listenerE = lastPair.server;
+  const replayed = listenerE.sent.filter(isDeliveryFrame).map((d) => JSON.parse(d).delivery_id);
+  check('s21: deliveries survive room eviction (storage rehydrates + replays)', replayed.length === 5 && replayed[0] === 'do3' && replayed[4] === 'do7', JSON.stringify(replayed));
+
+  // Alarm prune: expired entries are dropped and the storage key deleted —
+  // medical text never lingers server-side past the retention window.
+  check('s21: the cleanup alarm was armed on write', typeof alarmAt === 'number' && alarmAt > Date.now(), String(alarmAt));
+  room2.deliveries.forEach((d) => { d.ts -= 31 * 60 * 1000; });
+  await room2.alarm();
+  check('s21: the alarm prunes expired deliveries from storage', room2.deliveries.length === 0 && mem.get('deliveries') === undefined, JSON.stringify(mem.get('deliveries') || null));
 
   globalThis.Response = RealResponse;
   delete globalThis.WebSocketPair;

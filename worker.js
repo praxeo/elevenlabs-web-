@@ -4,19 +4,81 @@ import { KEYTERM_PRESETS } from './keyterms.js';
 // here (fire-and-forget); desktop listeners receive them over a WebSocket.
 // Resilience contract with the client:
 //   - answers {"message_type":"ping"} with a pong (zombie-socket detection);
-//   - retains the most recent phone_delivery and replays it to (re)connecting
-//     listeners within the replay window (clients dedupe by delivery_id);
+//   - retains recent phone_deliveries in a small ring PERSISTED to DO storage
+//     (survives room eviction — the old single in-memory slot silently lost
+//     undelivered notes whenever the idle room was reclaimed) and replays every
+//     fresh entry to (re)connecting listeners within the retention window
+//     (clients dedupe by delivery_id, so over-replay can never double-copy);
 //   - acks /broadcast with the listener count, so the phone can fail loudly
-//     when nobody was listening instead of assuming success.
-const DELIVERY_REPLAY_WINDOW_MS = 2 * 60 * 1000;
+//     when nobody was listening instead of assuming success;
+//   - GET /status reports listener presence + buffered count — a cue for the
+//     phone's "desktop connected" pill, never load-bearing;
+//   - a storage alarm prunes the ring, so medical text never lingers
+//     server-side past the retention window (in-memory eviction used to
+//     guarantee that for free; persistence must do it explicitly).
+// Retention matches the phone queue's DELIVERY_QUEUE_TTL_MS judgment of "still
+// safe to auto-land on the desktop" (the phone auto-re-POSTs a note this old
+// anyway — the room path now just matches it; was a 2-min in-memory window).
+const DELIVERY_RETAIN_MS  = 30 * 60 * 1000;
+// Ring size stays UNDER the desktop's 12-id dedupe ring, so replaying the whole
+// ring to a reconnecting listener can never re-copy a note it already saw. A
+// single slot could not replay multi-note losses (a dead-but-open socket "acks"
+// several sends before its pong timeout unmasks it — each overwrote the slot).
+const DELIVERY_RETAIN_MAX = 5;
 
 export class SessionRoom {
   constructor(state, env) {
+    this.state = state || {};
     this.listeners = new Map(); // id -> WebSocket
-    this.lastDelivery = null;   // { body, ts } — most recent phone_delivery
+    this.deliveries = null;     // [{ body, ts }] oldest→newest — lazily loaded from storage
+    this.loading = null;
+  }
+
+  // Load the persisted ring once per instance life. Fully best-effort: absent/
+  // failing storage (tests pass a bare state; a platform storage error) just
+  // degrades to the pre-persistence in-memory behavior — the delivery path
+  // must never 500 because durability was unavailable.
+  async ensureLoaded() {
+    if (this.deliveries) return;
+    if (!this.loading) {
+      this.loading = (async () => {
+        let arr = null;
+        try {
+          if (this.state.storage) arr = await this.state.storage.get("deliveries");
+        } catch {}
+        this.deliveries = Array.isArray(arr) ? arr : [];
+      })();
+    }
+    await this.loading;
+  }
+
+  freshDeliveries(now) {
+    return this.deliveries.filter((d) => d && typeof d.ts === "number" && now - d.ts < DELIVERY_RETAIN_MS);
+  }
+
+  // Prune + cap the ring, write it through (best-effort), and arm the cleanup
+  // alarm so stored text expires even if the room then sits idle.
+  async persistDeliveries(now) {
+    this.deliveries = this.freshDeliveries(now).slice(-DELIVERY_RETAIN_MAX);
+    try {
+      if (this.state.storage) {
+        if (this.deliveries.length) {
+          await this.state.storage.put("deliveries", this.deliveries);
+          if (this.state.storage.setAlarm) await this.state.storage.setAlarm(now + DELIVERY_RETAIN_MS + 1000);
+        } else {
+          await this.state.storage.delete("deliveries");
+        }
+      }
+    } catch {}
+  }
+
+  async alarm() {
+    await this.ensureLoaded();
+    await this.persistDeliveries(Date.now()); // drops everything expired; deletes the key when empty
   }
 
   async fetch(request) {
+    await this.ensureLoaded();
     const url = new URL(request.url);
 
     if (request.headers.get("Upgrade") === "websocket") {
@@ -35,18 +97,35 @@ export class SessionRoom {
           }
         } catch {}
       });
-      // A delivery that raced a listener drop must still reach the desktop.
-      if (this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS) {
-        try { server.send(this.lastDelivery.body); } catch {}
+      // Deliveries that raced a listener drop must still reach the desktop —
+      // replay every fresh entry oldest→newest (the desktop's persisted
+      // delivery_id ring makes an already-seen replay a no-op).
+      for (const d of this.freshDeliveries(Date.now())) {
+        try { server.send(d.body); } catch {}
       }
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (request.method === "GET" && url.pathname.endsWith("/latest")) {
-      const fresh = this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS;
-      const body = fresh
-        ? '{"ok":true,"age_ms":' + (Date.now() - this.lastDelivery.ts) + ',"delivery":' + this.lastDelivery.body + '}'
-        : '{"ok":true,"delivery":null}';
+      const now = Date.now();
+      const fresh = this.freshDeliveries(now);
+      const newest = fresh.length ? fresh[fresh.length - 1] : null;
+      // Back-compat: "delivery" stays the single newest entry (the AHK poller
+      // reads exactly that); "deliveries" (oldest→newest) is additive, for the
+      // desktop's poll fallback to sweep everything it may have missed.
+      const body = newest
+        ? '{"ok":true,"age_ms":' + (now - newest.ts) + ',"delivery":' + newest.body +
+          ',"deliveries":[' + fresh.map((d) => d.body).join(",") + ']}'
+        : '{"ok":true,"delivery":null,"deliveries":[]}';
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }
+
+    if (request.method === "GET" && url.pathname.endsWith("/status")) {
+      // Presence CUE for the phone's pill. listeners.size can briefly include a
+      // zombie socket (until its close event / the desktop's pong timeout), so
+      // this must never gate anything — it only informs.
+      const body = '{"ok":true,"listeners":' + this.listeners.size +
+                   ',"buffered":' + this.freshDeliveries(Date.now()).length + '}';
       return new Response(body, { headers: { "content-type": "application/json" } });
     }
 
@@ -54,7 +133,11 @@ export class SessionRoom {
       const message = await request.text();
       let isDelivery = false;
       try { isDelivery = JSON.parse(message).message_type === "phone_delivery"; } catch {}
-      if (isDelivery) this.lastDelivery = { body: message, ts: Date.now() };
+      if (isDelivery) {
+        const now = Date.now();
+        this.deliveries.push({ body: message, ts: now });
+        await this.persistDeliveries(now); // prune + cap + write-through + alarm
+      }
       let delivered = 0;
       for (const [id, ws] of this.listeners) {
         try { ws.send(message); delivered++; } catch { this.listeners.delete(id); }
@@ -154,9 +237,15 @@ export default {
       }
       // Native pollers (e.g. the AHK script): read the held delivery without
       // joining the room — lets a native app write the clipboard with no
-      // browser-focus requirement.
+      // browser-focus requirement. (The desktop's poll fallback reads the
+      // additive "deliveries" array from the same route.)
       if (request.method === "GET" && parts[4] === "latest") {
         return stub.fetch("https://session-room/latest");
+      }
+      // Desktop-presence cue for the phone's pill ({listeners, buffered}) —
+      // informational only, never gates recording or delivery.
+      if (request.method === "GET" && parts[4] === "status") {
+        return stub.fetch("https://session-room/status");
       }
       return new Response("Not found", { status: 404 });
     }
