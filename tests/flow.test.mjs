@@ -35,9 +35,17 @@
 //      falls back to live text (cancelled by the real delivery), and the
 //      phone treats a zero-listener deliver ack as a loud failure
 //  20q. phone-side durable delivery queue: a failed/zero-listener /deliver
-//      enqueues the text (persisted), an online/boot heal re-POSTs it with the
-//      SAME id until a listener acks (then the queue clears), and the desktop
-//      ring-dedupe drops a stale re-POST arriving after a newer delivery
+//      enqueues the text (persisted + CODE-BOUND), an online/boot heal re-POSTs
+//      it with the SAME id until a listener acks (then the queue clears), the
+//      desktop ring-dedupe drops a stale re-POST arriving after a newer
+//      delivery, Leave KEEPS the queue (rejoining the same code auto-delivers —
+//      the stranded-note incident self-heals), a different-code join keeps the
+//      item but never POSTs it there, and a legacy no-code item is stamped with
+//      the persisted join at boot
+//  34. manual "Send to desktop" (box / history rows / expanded big-peek, joined
+//      + idle only) pushes existing text through the normal queue+cue path with
+//      a fresh delivery_id; the queue chip surfaces undelivered notes and a tap
+//      retries; everything hides when unjoined
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
 //      held-delivery replay inside the window only, transcripts not buffered,
 //      GET /latest for native pollers (fresh delivery vs stale null)
@@ -1100,15 +1108,42 @@ console.log('--- scenario 20q: phone delivery queue ---');
   check('s20q: a delivered item clears the queue', queue20q().length === 0, JSON.stringify(queue20q()));
   check('s20q: a drained queue gives quiet positive closure', status20q().includes('delivered to the desktop'), status20q());
 
-  // Leaving the session abandons any queued deliveries (text stays in history).
+  // Leave KEEPS the queued deliveries (code-bound) — the old wipe here
+  // destroyed the undelivered note a clinician was trying to recover, because
+  // re-linking passes through Leave. The user's field incident.
   deliverMode = 'fail';
   doc20q.getElementById('recordBtn').click();
   await sleep(80);
   doc20q.getElementById('recordBtn').click();
   await sleep(600);
   check('s20q: a second failure re-queues', queue20q().length === 1, JSON.stringify(queue20q()));
+  check('s20q: the queued item is code-bound', queue20q()[0] && queue20q()[0].code === 'QUE111', JSON.stringify(queue20q()[0]));
   doc20q.getElementById('phoneLeaveBtn').click();
-  check('s20q: Leave clears the delivery queue', queue20q().length === 0, JSON.stringify(queue20q()));
+  await sleep(30);
+  check('s20q: Leave KEEPS the code-bound queue (text no longer destroyed)', queue20q().length === 1, JSON.stringify(queue20q()));
+  check('s20q: Leave says the undelivered note is kept', status20q().includes('undelivered note') && status20q().includes('kept'), status20q());
+  check('s20q: the queue chip shows the stranded note while unjoined', doc20q.getElementById('queueChip').style.display !== 'none' && doc20q.getElementById('queueChip').textContent.includes('another desktop'), doc20q.getElementById('queueChip').textContent);
+
+  // Joining a DIFFERENT desktop: the item is kept but NEVER auto-POSTed to the
+  // wrong code (stale text must not land on the wrong chart).
+  deliverMode = 'ok';
+  const deliverCount1 = deliveries20q().length;
+  doc20q.getElementById('phoneJoinInput').value = 'OTHER9';
+  doc20q.getElementById('phoneJoinBtn').click();
+  await sleep(300);
+  const wrongCodePosts = deliveries20q().slice(deliverCount1).filter((c) => c.url.includes('/api/session/OTHER9/'));
+  check('s20q: a different-code join never POSTs the old-code item', wrongCodePosts.length === 0, wrongCodePosts.map((c) => c.url).join(','));
+  check('s20q: the item survives the different-code join', queue20q().length === 1 && queue20q()[0].code === 'QUE111', JSON.stringify(queue20q()));
+
+  // REJOINING the original code auto-flushes it — the incident self-heals.
+  doc20q.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  doc20q.getElementById('phoneJoinInput').value = 'QUE111';
+  doc20q.getElementById('phoneJoinBtn').click();
+  await sleep(300);
+  const rejoinPosts = deliveries20q().filter((c) => c.url.includes('/api/session/QUE111/'));
+  check('s20q: rejoining the SAME code auto-delivers the stranded note', queue20q().length === 0 && rejoinPosts.length > deliverCount1 - 1, JSON.stringify(queue20q()));
+  check('s20q: the queue chip clears once delivered', doc20q.getElementById('queueChip').style.display === 'none', doc20q.getElementById('queueChip').style.display);
 }
 
 {
@@ -1133,7 +1168,9 @@ console.log('--- scenario 20q: phone delivery queue ---');
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
       // Seed a persisted join + an undelivered queued delivery: a phone that
-      // died after transcribing but before its relay landed.
+      // died after transcribing but before its relay landed. The item has NO
+      // code field (a legacy pre-code-binding queue) — loadSettings must stamp
+      // it with the persisted join so it still flushes after the update.
       win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({
         saveApiKey: true,
         joinedSessionCode: 'BOOT22',
@@ -1571,7 +1608,7 @@ console.log('--- scenario 24: QR join ---');
       win.URL.createObjectURL = () => 'blob:mock';
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
       win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks23.push(this); } };
@@ -1623,7 +1660,7 @@ console.log('--- scenario 24: QR join ---');
       win.URL.createObjectURL = () => 'blob:mock';
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.fetch = (url, opts) => {
         fetch23p.push({ url: String(url), opts: opts || {} });
         if (String(url).includes('/deliver')) {
@@ -2975,6 +3012,105 @@ console.log('--- scenario 38: idle mic-health sampler (proactive corpse rebuild)
   micRms = 0.05;
 }
 
+// ===== Scenario 34: manual "Send to desktop" + the queue chip =====
+// The universal recovery for a stranded note: on a joined device, the box, the
+// history rows, and the expanded big-peek can push their text to the desktop
+// through the normal queue+flush+cue path (fresh delivery_id, cleaned text,
+// idle-only). The queue chip makes undelivered notes visible and tap-flushable.
+console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
+{
+  const fetch34 = [];
+  let deliver34 = 'ok'; // 'ok' | 'fail'
+  const dom34 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch34.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/deliver')) {
+          if (deliver34 === 'fail') return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('boom') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Fresh take."}') });
+      };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'SEND01', micGranted: true }));
+      win.localStorage.setItem('scribe_v2_transcripts_v9', JSON.stringify([
+        { text: 'History note from earlier. ', createdAt: new Date().toISOString(), engine: 'batch' },
+      ]));
+    },
+  });
+  await sleep(180);
+  const doc34 = dom34.window.document;
+  const st34 = () => doc34.getElementById('status').textContent;
+  const deliveries34 = () => fetch34.filter((c) => c.url.includes('/deliver') && c.opts && String(c.opts.body).includes('phone_delivery'));
+  doc34.getElementById('apiKey').value = 'test-key';
+
+  // (a) The box's send button: visible when joined, sends the restored note.
+  const sendBtn = doc34.getElementById('sendDesktopBtn');
+  check('s34a: the send button is visible on a joined device', sendBtn.style.display !== 'none' && !sendBtn.disabled, sendBtn.style.display + '/' + sendBtn.disabled);
+  const n0 = deliveries34().length;
+  sendBtn.click();
+  await sleep(250);
+  const sent = deliveries34().slice(n0);
+  check('s34a: the send POSTs a fresh phone_delivery to the joined code', sent.length === 1 && sent[0].url.includes('/api/session/SEND01/deliver'), JSON.stringify(sent.map((c) => c.url)));
+  check('s34a: the sent text is the cleaned box note', sent.length && JSON.parse(sent[0].opts.body).text.includes('History note from earlier.'), sent.length && sent[0].opts.body);
+  check('s34a: a fresh delivery_id rides the manual send', sent.length && !!JSON.parse(sent[0].opts.body).delivery_id, sent.length && sent[0].opts.body);
+  check('s34a: the delivered manual send announces Done', st34().includes('Delivered to the desktop clipboard. Done!'), st34());
+
+  // (b) Mid-session the manual send is a no-op (idle-only guard).
+  micRms = 0.05;
+  doc34.getElementById('recordBtn').click();
+  await sleep(120);
+  const n1 = deliveries34().length;
+  check('s34b: the send button is disabled mid-session', sendBtn.disabled === true, String(sendBtn.disabled));
+  sendBtn.click();
+  await sleep(120);
+  check('s34b: a mid-session send click POSTs nothing', deliveries34().length === n1, deliveries34().length - n1 + ' extra');
+  doc34.getElementById('recordBtn').click(); // stop; the take relays normally (+1 delivery)
+  await sleep(500);
+
+  // (c) History rows carry a per-row send button while joined.
+  doc34.getElementById('toggleHistoryBtn').click();
+  await sleep(30);
+  const rowSend = Array.from(doc34.querySelectorAll('#history button')).find((b) => b.textContent.includes('Send to desktop'));
+  check('s34c: history rows offer Send to desktop while joined', !!rowSend, Array.from(doc34.querySelectorAll('#history button')).map((b) => b.textContent).join('|'));
+  const n2 = deliveries34().length;
+  rowSend.click();
+  await sleep(250);
+  check('s34c: the history-row send delivers that row\'s text', deliveries34().length === n2 + 1, (deliveries34().length - n2) + ' posts');
+
+  // (d) The expanded big-peek offers the send button on the phone surface.
+  doc34.getElementById('bigPeekBar').click(); // expand
+  await sleep(30);
+  const bigSend = doc34.getElementById('bigSendBtn');
+  check('s34d: the expanded big-peek shows Send to desktop again', bigSend.style.display !== 'none', bigSend.style.display);
+
+  // (e) A failed delivery queues + the chip shows; a tap retries and clears it.
+  deliver34 = 'fail';
+  doc34.getElementById('recordBtn').click();
+  await sleep(120);
+  doc34.getElementById('recordBtn').click();
+  await sleep(600);
+  const chip = doc34.getElementById('bigQueueChip');
+  check('s34e: an undelivered note lights the queue chip', chip.style.display !== 'none' && chip.textContent.includes('waiting to send'), chip.textContent);
+  deliver34 = 'ok';
+  chip.click();
+  await sleep(300);
+  check('s34e: tapping the chip flushes the queue', chip.style.display === 'none', chip.style.display + ' / ' + chip.textContent);
+
+  // (f) Unjoined devices never show the send affordances.
+  doc34.getElementById('phoneLeaveBtn').click();
+  await sleep(30);
+  check('s34f: the send button hides when not joined', sendBtn.style.display === 'none', sendBtn.style.display);
+}
+
 // ===== Scenario 25w: joined + degraded outcome — the relay ack must WARN, never doneBeep =====
 // A large speaker-filter cut is a degraded outcome. On a joined phone the relay
 // ack owns the outcome cue — and before this fix a "delivered" ack played the
@@ -2992,7 +3128,7 @@ console.log('--- scenario 25w: joined degraded outcome gets warnBeep on the deli
       win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.navigator.vibrate = (p) => { vibes25w.push(p); return true; };
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.MediaRecorder = class {
         constructor() { this.state = 'inactive'; }
         static isTypeSupported() { return false; }
@@ -3057,7 +3193,7 @@ console.log('--- scenario 39: transcript-coverage guard ---');
           Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state.skewMs - t0) / 1000, configurable: true });
         }
       };
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.MediaRecorder = class {
         constructor() { this.state = 'inactive'; }
         static isTypeSupported() { return false; }
@@ -3157,7 +3293,7 @@ console.log('--- scenario 40: duration-aware upload deadline (16 s response on a
           Object.defineProperty(this, 'currentTime', { get: () => (realNow() + state40.skewMs - t0) / 1000, configurable: true });
         }
       };
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.MediaRecorder = class {
         constructor() { this.state = 'inactive'; }
         static isTypeSupported() { return false; }
@@ -3221,7 +3357,7 @@ console.log('--- scenario 41: journal cap honesty ---');
       win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.indexedDB = idb;
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
       win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); } };
       const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
       win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"recovered"}') });

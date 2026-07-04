@@ -571,6 +571,13 @@ const INDEX_HTML = `<!doctype html>
     #bigMicPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
     #bigMicPill.ok { color: var(--muted); }
     #bigMicPill.bad { color: var(--danger); font-weight: 600; }
+    /* Undelivered-notes chips (phone delivery queue) — tappable, warn-toned. */
+    #queueChip, #bigQueueChip {
+      color: var(--warn); border: 1px solid var(--warn); border-radius: 10px;
+      padding: 2px 10px; font-size: 12.5px; cursor: pointer; user-select: none;
+    }
+    #bigQueueChip { flex: 0 0 auto; text-align: center; margin: 6px auto 0; max-width: 92%; }
+    #bigSendBtn { margin-top: 8px; width: 100%; }
     #bigCenter {
       flex: 1 1 auto; min-height: 0; width: 100%; display: flex;
       flex-direction: column; align-items: center; justify-content: center; gap: 14px;
@@ -682,6 +689,9 @@ const INDEX_HTML = `<!doctype html>
         <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+        <!-- Joined devices only: re-send the note to the desktop clipboard (a
+             fresh delivery — the recovery for a note stranded by a link outage). -->
+        <button id="sendDesktopBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery, even if the link was down when it was dictated">📤 Send to desktop</button>
       </div>
 
       <!-- "Last dictation" slot: the most recently filed note. The box above is
@@ -702,6 +712,9 @@ const INDEX_HTML = `<!doctype html>
              the desktop user knows audio is being captured before the text lands.
              Hidden until a phone_recording ping arrives (relayed, not buffered). -->
         <span id="phoneRecBadge" style="display:none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600;"></span>
+        <!-- Undelivered-notes chip: visible only while the phone-side delivery
+             queue holds something (compactness contract) — tap retries now. -->
+        <span id="queueChip" style="display:none" role="button"></span>
       </div>
     </section>
 
@@ -922,6 +935,7 @@ right lower quadrant"></textarea>
       <button id="bigLeaveBtn">Leave</button>
       <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
     </div>
+    <div id="bigQueueChip" style="display:none" role="button"></div>
     <div id="bigCenter">
       <div id="bigState">READY</div>
       <button id="bigBtn">HOLD TO TALK</button>
@@ -931,6 +945,7 @@ right lower quadrant"></textarea>
     <div id="bigPeek">
       <div id="bigPeekBar">Latest transcript — tap to expand</div>
       <div id="bigPeekText"></div>
+      <button id="bigSendBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery">📤 Send to desktop again</button>
     </div>
   </div>
   <button id="bigReturnBtn">&#8592; Back to the button</button>
@@ -1012,6 +1027,10 @@ right lower quadrant"></textarea>
   const recordBtn        = document.getElementById("recordBtn");
   const clearBtn         = document.getElementById("clearBtn");
   const copyBtn          = document.getElementById("copyBtn");
+  const sendDesktopBtn   = document.getElementById("sendDesktopBtn");
+  const queueChipEl      = document.getElementById("queueChip");
+  const bigQueueChipEl   = document.getElementById("bigQueueChip");
+  const bigSendBtnEl     = document.getElementById("bigSendBtn");
   const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
   const lastDictationEl     = document.getElementById("lastDictation");
@@ -1581,6 +1600,12 @@ right lower quadrant"></textarea>
     const busy = recording || stopping || finishing;
     if (copyBtn)  copyBtn.disabled  = !hasText || busy;
     if (freshBtn) freshBtn.disabled = busy;
+    // Manual desktop re-send: joined devices only, idle-only (its outcome cue
+    // must never collide with a live session's single beep).
+    if (sendDesktopBtn) {
+      sendDesktopBtn.style.display = joinedSessionCode ? "" : "none";
+      sendDesktopBtn.disabled = !hasText || busy;
+    }
     updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
     if (!hasText || busy) {
       appendChipEl.style.display = "none";
@@ -1953,6 +1978,13 @@ right lower quadrant"></textarea>
         deliveryQueue = s.pendingDeliveries.filter(function (it) {
           return it && typeof it.id === "string" && typeof it.text === "string" && typeof it.ts === "number";
         });
+        // Migrate legacy (pre code-binding) items: they can only have been
+        // enqueued under the join persisted alongside them (the old code wiped
+        // the queue on every code switch), so stamping that code is faithful —
+        // and keeps a stranded note flushable after this update lands.
+        deliveryQueue.forEach(function (it) {
+          if (typeof it.code !== "string") it.code = joinedSessionCode || "";
+        });
       }
       if (s.micGranted === true) micEverGranted = true;
       if (s.micTipsSeen === true) micTipsSeen = true;
@@ -2272,6 +2304,18 @@ right lower quadrant"></textarea>
       copy.onclick = () => copyText(text.textContent);
 
       row.append(copy);
+
+      // Joined: any past note can be pushed to the desktop clipboard — the
+      // recovery for a note stranded by a link outage (even one that aged past
+      // the delivery-queue TTL or is bound to an old session code).
+      if (joinedSessionCode) {
+        const send = document.createElement("button");
+        send.textContent = "📤 Send to desktop";
+        send.title = "Send this note to the desktop clipboard (a fresh delivery)";
+        send.onclick = () => sendTextToDesktop(text.textContent);
+        row.append(send);
+      }
+
       div.append(meta, text, row);
       historyEl.append(div);
     }
@@ -4006,6 +4050,7 @@ right lower quadrant"></textarea>
       // delivery landed boots with the text still queued — flush it now.
       if (deliveryQueue.length) backgroundFlush();
     }
+    updateQueueChip(); // undelivered notes surface immediately at boot, joined or not
   }
 
   function connectPhoneSessionWs() {
@@ -4276,6 +4321,12 @@ right lower quadrant"></textarea>
       id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
       text: text,
       ts: Date.now(),
+      // Code-bound: the item may only ever auto-deliver to the desktop it was
+      // dictated FOR. Leave/rejoin no longer wipe the queue (that destroyed
+      // undelivered patient text — the field incident this fixes); instead the
+      // flush skips items whose code differs, so a note can never auto-paste
+      // onto a different clinic's desktop.
+      code: joinedSessionCode,
     };
     deliveryQueue.push(item);
     // An unbounded retry buffer is its own failure mode: drop the OLDEST
@@ -4283,6 +4334,7 @@ right lower quadrant"></textarea>
     // item is at the tail, so it is never the one dropped.
     while (deliveryQueue.length > DELIVERY_QUEUE_MAX) deliveryQueue.shift();
     saveSettingsNow();
+    updateQueueChip();
     return item;
   }
 
@@ -4292,9 +4344,10 @@ right lower quadrant"></textarea>
     var before = deliveryQueue.length;
     // A delivery too old to land safely (the user has moved on) must NOT auto-
     // paste onto a chart hours later — drop it from the retry queue. It remains
-    // in history, and the original failure was already announced loud.
+    // in history, and the original failure was already announced loud. Applies
+    // to items bound to another code too (they age out the same way).
     deliveryQueue = deliveryQueue.filter(function (it) { return now - it.ts < DELIVERY_QUEUE_TTL_MS; });
-    if (deliveryQueue.length !== before) saveSettingsNow();
+    if (deliveryQueue.length !== before) { saveSettingsNow(); updateQueueChip(); }
   }
 
   function scheduleDeliveryRetry() {
@@ -4311,14 +4364,18 @@ right lower quadrant"></textarea>
   //   "buffered"  — POST ok but zero listeners (room holds it; keep + retry)
   //   "failed"    — POST error/timeout (link down; keep + stop this round)
   async function postDelivery(item) {
-    if (!joinedSessionCode) return "failed";
+    // POST to the code the item was BOUND to at enqueue (doFlush only posts
+    // items matching the current join, so these agree; the fallback covers a
+    // legacy item that somehow lost its stamp).
+    var code = item.code || joinedSessionCode;
+    if (!code) return "failed";
     var payload = JSON.stringify({ message_type: "phone_delivery", text: item.text, delivery_id: item.id });
     // A black-holed POST must still produce an outcome: without a deadline a
     // hung relay reports nothing at all (and would stall a queued session).
     var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     var killer = ctrl ? setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, RELAY_TIMEOUT_MS) : null;
     try {
-      var res = await fetch("/api/session/" + joinedSessionCode + "/deliver", {
+      var res = await fetch("/api/session/" + code + "/deliver", {
         method: "POST",
         body: payload,
         headers: { "Content-Type": "application/json" },
@@ -4352,26 +4409,39 @@ right lower quadrant"></textarea>
     // flush (a new dictation racing a background retry) is left for its own
     // chained flush, so the dictation that enqueued it always learns its own
     // outcome — and FIFO order is preserved.
+    // Items bound to a DIFFERENT code are SKIPPED, never auto-POSTed (stale
+    // text must not land on the wrong desktop's chart — the safety the old
+    // Leave/switch wipes provided, without destroying the text). They stay
+    // queued for a same-code rejoin, the TTL prune, or a manual send.
     var snapshot = deliveryQueue.map(function (it) { return it.id; });
     var blocked = "";          // the result that stopped the round (buffered/failed)
     var reachedCurrent = false;
-    while (deliveryQueue.length) {
-      var item = deliveryQueue[0];
+    var i = 0;
+    while (i < deliveryQueue.length) {
+      var item = deliveryQueue[i];
       if (snapshot.indexOf(item.id) === -1) break; // enqueued after this flush began
+      if (item.code !== joinedSessionCode) { i++; continue; } // another desktop's item: keep, skip
       var isCurrent = Boolean(opts.currentId && item.id === opts.currentId);
       var result = await postDelivery(item);
       if (result === "delivered") {
         if (isCurrent) reachedCurrent = true;
-        deliveryQueue.shift(); // index 0 is still this item (flushChain serializes mutation)
+        // Remove by identity — the splice keeps foreign-code items ahead of us
+        // intact (flushChain serializes mutation, so the index is still valid).
+        var idx = deliveryQueue.indexOf(item);
+        if (idx !== -1) deliveryQueue.splice(idx, 1);
         saveSettingsNow();
         deliveryRetryDelayMs = 0;
       } else {
         blocked = result;            // buffered or failed
         if (isCurrent) reachedCurrent = true;
-        break;                       // head-of-line: nothing behind it can land either
+        break;                       // head-of-line among this code's items: nothing behind can land either
       }
     }
-    if (deliveryQueue.length) scheduleDeliveryRetry();
+    updateQueueChip();
+    // Re-arm the backoff only when something here can actually be retried —
+    // a queue holding only another desktop's items would spin a no-op timer.
+    var hasCurrentCode = deliveryQueue.some(function (it) { return it.code === joinedSessionCode; });
+    if (hasCurrentCode) scheduleDeliveryRetry();
     if (!opts.currentId) return "";
     // current delivered ⇒ "delivered"; current itself blocked ⇒ that result;
     // an EARLIER item blocked (current never reached) ⇒ current is behind a
@@ -4392,6 +4462,62 @@ right lower quadrant"></textarea>
     if (had && deliveryQueue.length === 0 && !recording && !stopping && !finishing) {
       setStatus("Queued transcript" + (had > 1 ? "s" : "") + " delivered to the desktop. Done!", "ok");
     }
+  }
+
+  // Manual "Send to desktop": push EXISTING text (the box, a history row, the
+  // big-peek note) to the joined desktop through the SAME queue→flush→cue path
+  // as a live dictation — the universal recovery for a note stranded by a link
+  // outage, including one that outlived the queue TTL or is bound to an old
+  // code (history keeps the text; this enqueues a fresh delivery under the
+  // CURRENT code). Idle-only so its cue can never collide with a live
+  // session's single outcome beep. A fresh delivery_id is deliberate: an
+  // explicit re-send SHOULD deliver again — the desktop dedupe ring only
+  // blocks unintentional replays (and the desktop's append mode applies, as
+  // with any delivery).
+  function sendTextToDesktop(text) {
+    if (!joinedSessionCode) return;
+    if (recording || stopping || finishing) return;
+    var t = cleanTranscript(String(text || ""));
+    if (!t.trim()) return;
+    setStatus("Sending to the desktop…", "warn");
+    relayDeliveryToDesktop(t, true);
+  }
+
+  // Undelivered notes must be VISIBLE, never just silently retried: a tappable
+  // chip on both layouts shows the queue depth, split by whether items target
+  // the CURRENT desktop (auto-retrying) or a different one (inert until a
+  // same-code rejoin / manual send / TTL).
+  function updateQueueChip() {
+    var mine = 0, foreign = 0;
+    for (var i = 0; i < deliveryQueue.length; i++) {
+      if (joinedSessionCode && deliveryQueue[i].code === joinedSessionCode) mine++;
+      else foreign++;
+    }
+    var label = "";
+    if (mine) {
+      label = "⏳ " + mine + " note" + (mine === 1 ? "" : "s") + " waiting to send — tap to retry now";
+      if (foreign) label += " (+" + foreign + " for another desktop)";
+    } else if (foreign) {
+      label = "⏳ " + foreign + " undelivered note" + (foreign === 1 ? "" : "s") + " for another desktop — rejoin that code, or send from History";
+    }
+    var els = [queueChipEl, bigQueueChipEl];
+    for (var j = 0; j < els.length; j++) {
+      var el = els[j];
+      if (!el) continue;
+      if (!label) { el.style.display = "none"; continue; }
+      el.style.display = "";
+      el.textContent = label;
+    }
+  }
+
+  function queueChipTapped() {
+    if (!deliveryQueue.length) return;
+    if (!joinedSessionCode) {
+      setStatus("Join the desktop's code first — queued notes deliver once joined (or use 'Send to desktop' in History).", "warn");
+      return;
+    }
+    setStatus("Retrying queued deliveries…", "warn");
+    backgroundFlush();
   }
 
   // Phone side: relay the final text to the desktop via the durable queue.
@@ -4468,6 +4594,7 @@ right lower quadrant"></textarea>
         : "Not joined — dictating to this device";
     }
     if (bigLeaveBtnEl) bigLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
+    updateQueueChip(); // the big-layout chip needs a paint when the surface flips
     updateBigScreen();
     maybeAutoShowMicTips(); // first time on the phone surface: nudge about other-voice rejection
   }
@@ -4534,6 +4661,13 @@ right lower quadrant"></textarea>
         ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
         : "Latest transcript — tap to expand";
     if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
+    // Manual re-send from the phone surface (the overlay covers the normal
+    // card, so the expanded peek is where the note is reachable): joined +
+    // idle + something to send.
+    if (bigSendBtnEl) {
+      bigSendBtnEl.style.display =
+        (bigPeekExpanded && joinedSessionCode && latestText && !recording && !stopping && !finishing) ? "" : "none";
+    }
   }
 
   // Press/release handling. Pointer capture plus the cancel/lost/document
@@ -4602,6 +4736,10 @@ right lower quadrant"></textarea>
     // one-shot rules live in exactly one place (the box click now edits, not arms).
     toggleAppendArm();
   });
+  if (bigSendBtnEl) bigSendBtnEl.onclick = () => sendTextToDesktop(latestText);
+  if (sendDesktopBtn) sendDesktopBtn.onclick = () => sendTextToDesktop(latestText);
+  if (queueChipEl) queueChipEl.onclick = () => queueChipTapped();
+  if (bigQueueChipEl) bigQueueChipEl.onclick = () => queueChipTapped();
 
   if (bigLeaveBtnEl) bigLeaveBtnEl.onclick = () => { if (phoneLeaveBtnEl) phoneLeaveBtnEl.click(); };
   if (bigSettingsBtnEl) bigSettingsBtnEl.onclick = () => setBigSettingsVisible(true);
@@ -4744,10 +4882,12 @@ right lower quadrant"></textarea>
     var code = (phoneJoinInputEl ? phoneJoinInputEl.value : "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
     if (code !== joinedSessionCode) {
-      // Switching to a different desktop: queued deliveries target the OLD code
-      // and must never misdeliver to the new one (stale text on the wrong
-      // chart). Drop them (still in history) and start the backoff over.
-      deliveryQueue = [];
+      // Switching to a different desktop: queued deliveries stay CODE-BOUND
+      // (doFlush never auto-POSTs them to this new code — stale text must not
+      // land on the wrong chart) but are KEPT: wiping them here destroyed
+      // undelivered patient text when a clinician re-linked (the field
+      // incident). They flush on a same-code rejoin, age out via the TTL, or
+      // go manually via "Send to desktop". Only the backoff restarts.
       if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
       deliveryRetryDelayMs = 0;
     }
@@ -4757,7 +4897,13 @@ right lower quadrant"></textarea>
     saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
     notifyDesktopOfJoin(code); // close the desktop's pairing QR overlay right away
     applyBigButtonUI(); // joining flips this device into the big-button layout
+    updateQueueChip();
+    updateAppendChip(); // the manual "Send to desktop" button appears when joined
+    renderHistory();    // history rows gain their per-row send buttons
     setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
+    // The self-heal moment for a stranded note: (re)joining the code its items
+    // are bound to flushes them right away — no waiting on the backoff timer.
+    if (deliveryQueue.length) backgroundFlush();
   };
   if (pairPhoneBtnEl) pairPhoneBtnEl.onclick = () => openPairOverlay();
   if (pairDoneBtnEl)  pairDoneBtnEl.onclick  = () => closePairOverlay();
@@ -4771,16 +4917,22 @@ right lower quadrant"></textarea>
 
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
     joinedSessionCode = "";
-    // Abandon any deliveries queued for the code we left (they target that
-    // code and can never be acked now; the text stays in this device's history).
-    deliveryQueue = [];
+    // Queued deliveries are KEPT (code-bound, so they can never misdeliver):
+    // re-linking passes through Leave, and the old wipe here destroyed the
+    // undelivered note the clinician was trying to recover. They flush on a
+    // same-code rejoin, age out via the TTL prune, or go via "Send to desktop"
+    // from History. Only the retry timer/backoff stop (nothing to POST to).
     if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
     deliveryRetryDelayMs = 0; // a fresh join must start the retry backoff over (cf. phoneReconnectDelayMs)
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
     phoneLeaveBtnEl.style.display = "none";
     saveSettingsNow();
     applyBigButtonUI(); // leaving reverts to the normal layout (unless the override is "always")
-    setStatus("Left the desktop session — dictations stay on this device now.", "ok");
+    updateQueueChip();
+    updateAppendChip(); // hide the manual "Send to desktop" button
+    renderHistory();    // drop the per-row send buttons
+    setStatus("Left the desktop session — dictations stay on this device now." +
+      (deliveryQueue.length ? " " + deliveryQueue.length + " undelivered note" + (deliveryQueue.length === 1 ? " is" : "s are") + " kept — rejoin that code to deliver, or send from History." : ""), "ok");
   };
 
   // "Append next" arms a one-shot: the next dictation is added onto the current
