@@ -568,6 +568,9 @@ const INDEX_HTML = `<!doctype html>
     }
     #bigTopRow { width: 100%; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
     #bigJoinedBadge { font-family: monospace; letter-spacing: 2px; color: var(--accent); font-size: 14px; flex: 1 1 auto; }
+    #bigMicPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+    #bigMicPill.ok { color: var(--muted); }
+    #bigMicPill.bad { color: var(--danger); font-weight: 600; }
     #bigCenter {
       flex: 1 1 auto; min-height: 0; width: 100%; display: flex;
       flex-direction: column; align-items: center; justify-content: center; gap: 14px;
@@ -914,6 +917,7 @@ right lower quadrant"></textarea>
   <div id="bigUi" data-screen="idle">
     <div id="bigTopRow">
       <span id="bigJoinedBadge"></span>
+      <span id="bigMicPill" style="display:none"></span>
       <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
       <button id="bigLeaveBtn">Leave</button>
       <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
@@ -1101,6 +1105,7 @@ right lower quadrant"></textarea>
   const bigStateEl       = document.getElementById("bigState");
   const bigStatusEl      = document.getElementById("bigStatus");
   const bigJoinedBadgeEl = document.getElementById("bigJoinedBadge");
+  const bigMicPillEl     = document.getElementById("bigMicPill");
   const bigLeaveBtnEl    = document.getElementById("bigLeaveBtn");
   const bigSettingsBtnEl = document.getElementById("bigSettingsBtn");
   const bigReturnBtnEl   = document.getElementById("bigReturnBtn");
@@ -1251,9 +1256,10 @@ right lower quadrant"></textarea>
   // looks engaged but records silence. Any backgrounding sets this; ensureAudio
   // then forces a full rebuild (a fresh getUserMedia track is genuinely live).
   let audioSuspect = false;
-  // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild). A reused
-  // graph is the iOS corpse-mic risk (track reports "live"/unmuted but delivers
-  // silence after a no-event session reclaim); the press-path probe guards it.
+  // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild).
+  // Bookkeeping only since the press-path probe went unconditional on the phone
+  // surface (probeMicAlive covers reused AND fresh graphs — a fresh iOS stream
+  // can itself be silent after an interruption).
   let audioReused = false;
   let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
   let gateIsOpen = false;
@@ -1293,11 +1299,23 @@ right lower quadrant"></textarea>
   const IOS_AUDIO_SEED_VERSION = 1;     // bump to re-push a corrected seed to un-tuned installs (additive, no _v9 bump)
   const IOS_SEED_MIC_GAIN      = 3;     // makeup gain x — deterministic + observable (gain:Nx in micDiag), unlike AGC
   const IOS_SEED_GATE_OPEN     = 0.018; // gate open threshold — well above gateClose 0.008
-  // Press-path corpse-mic probe (phone surface): one analyser frame on the REUSED
-  // mic below this RMS (a live mic always has a tiny floor; an iOS corpse delivers
-  // exact zeros) forces a fresh-getUserMedia rebuild so the take lands on a live
-  // mic. See probeMicLive.
+  // Press-path corpse-mic probe (phone surface): an analyser frame below this RMS
+  // means no audio is flowing (a live mic always has a tiny floor; an iOS corpse
+  // delivers exact zeros). EVERY big-button press probes — reused graphs exit on
+  // frame 0 (the analyser continuously reflects the live mic), a FRESH graph gets
+  // a short settle window for its first buffers (silence there isn't capturable
+  // anyway, so the wait can never swallow speech); only a dead mic pays the full
+  // bound, and a mic still dead after one forced rebuild fails LOUD before
+  // capture. See probeMicAlive + the startRecording press path.
   const MIC_PROBE_DEAD_RMS  = 0.00001;
+  const MIC_PROBE_SETTLE_MS = 400; // max wait for a first nonzero frame (fresh live graphs show one within ~1-3 frames)
+  const MIC_PROBE_FRAME_MS  = 30;  // probe poll cadence — matches the gate loop
+  // Idle mic-health sampler (big-button surface): iOS can kill the retained mic
+  // between takes with NO event while it keeps reporting "live". Sampling one
+  // analyser frame every few seconds catches the corpse while idle — rebuild
+  // then is free (nobody is speaking) and the next press lands on a live mic.
+  const MIC_IDLE_PROBE_MS   = 4000; // sampling cadence while idle + visible
+  const MIC_IDLE_DEAD_COUNT = 2;    // consecutive dead frames before rebuilding (one frame can race a teardown)
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -2540,30 +2558,74 @@ right lower quadrant"></textarea>
   }
 
   // Press-path corpse-mic catch (phone surface). After a NO-EVENT iOS session
-  // reclaim (Low Power Mode, an idle gap) the mic track keeps reporting
-  // "live"/unmuted but delivers pure silence (peak:0.00000) — audioGraphHealthy()
-  // trusts it and ensureAudio() REUSES it, so the take records nothing. When the
-  // graph was reused (a fresh rebuild is already genuinely live), read the
-  // analyser ONCE before capture: it continuously reflects the live mic (the
-  // AudioContext processes audio even while idle), so a single frame tells a
-  // corpse (exact zeros) from a live mic (always a tiny nonzero floor) with NO
-  // delay to the press — only a detected corpse pays the rebuild. Forcing ONE
-  // fresh getUserMedia lands the user's words on a live mic. Fully defensive: it
-  // can only ever ADD a rebuild, never block or break the press — a mic still
-  // dead after the rebuild then fails loud via the watchdog / the "MIC PRODUCED
-  // NO SIGNAL" finalize path, never silently.
-  async function probeMicLive() {
+  // reclaim (Low Power Mode, an idle gap, the VPIO wall after an interruption)
+  // the mic — a REUSED graph or even a FRESH getUserMedia stream — can report
+  // "live"/unmuted while delivering pure silence (peak:0.00000), so the take
+  // would record nothing. Read analyser frames until a live floor shows: a warm
+  // graph exits on frame 0 (the analyser continuously reflects the live mic —
+  // NO delay to the press), a fresh live graph within a frame or two while its
+  // first buffers fill (that audio isn't capturable yet anyway, so the wait can
+  // never swallow speech). Only a dead mic pays the full MIC_PROBE_SETTLE_MS
+  // bound. Returns true = live floor seen; false = flat silence throughout.
+  // Best-effort: any internal failure returns true so the probe can never block
+  // a press the rest of the pipeline vetted (the watchdog stays the backstop).
+  async function probeMicAlive() {
     try {
-      if (!bigButtonActive() || !analyserNode || !gateBuf) return;
+      if (!analyserNode || !gateBuf) return true;
+      var deadline = Date.now() + MIC_PROBE_SETTLE_MS;
+      for (;;) {
+        analyserNode.getFloatTimeDomainData(gateBuf);
+        var sum = 0;
+        for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
+        if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise(function (r) { setTimeout(r, MIC_PROBE_FRAME_MS); });
+      }
+    } catch (e) { return true; }
+  }
+
+  // Tiny mic-health pill on the big-button top row: "Mic ✓" (idle sampler saw a
+  // live floor) / "Mic ⚠ rebuilding" (a corpse was detected and is being
+  // rebuilt). A cue, never load-bearing — hidden whenever there is no verdict.
+  function setBigMicPill(state) {
+    if (!bigMicPillEl) return;
+    if (!state || !bigButtonActive()) { bigMicPillEl.style.display = "none"; return; }
+    bigMicPillEl.style.display = "";
+    if (state === "ok") { bigMicPillEl.textContent = "Mic ✓"; bigMicPillEl.className = "ok"; }
+    else { bigMicPillEl.textContent = "Mic ⚠ rebuilding"; bigMicPillEl.className = "bad"; }
+  }
+
+  // Idle mic-health sampler (big-button surface). Between takes iOS can kill the
+  // retained mic with NO event while it keeps reporting "live"; the wake lock
+  // reduces but does not eliminate it. One analyser frame every few seconds
+  // while idle + visible catches the corpse BEFORE the next press: rebuild is
+  // free while nobody is speaking, and the pill shows the verdict. Cue +
+  // proactive heal only — the press-path probe and the watchdog stay the
+  // load-bearing guards. Fully try/caught; must never break anything.
+  let micIdleTimer = null;
+  let micIdleDeadFrames = 0;
+  function micIdleSample() {
+    try {
+      if (!bigButtonActive() || document.visibilityState !== "visible") return;
+      if (recording || stopping || finishing) { micIdleDeadFrames = 0; return; } // sessions own the mic; the watchdog covers them
+      if (!analyserNode || !gateBuf || !audioGraphHealthy()) { micIdleDeadFrames = 0; setBigMicPill(""); return; } // cold or mid-rebuild: no verdict
       analyserNode.getFloatTimeDomainData(gateBuf);
       var sum = 0;
       for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
-      var rms = Math.sqrt(sum / gateBuf.length);
-      if (rms >= MIC_PROBE_DEAD_RMS) return; // a live floor is present — healthy, proceed with no delay
-      audioSuspect = true; // force ensureAudio to skip the healthy-reuse fast path
-      releaseAudio();
-      await ensureAudio();
-    } catch (e) { /* best-effort: a probe failure must never block the press */ }
+      if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) {
+        micIdleDeadFrames = 0;
+        setBigMicPill("ok");
+        return;
+      }
+      micIdleDeadFrames++;
+      if (micIdleDeadFrames >= MIC_IDLE_DEAD_COUNT) {
+        micIdleDeadFrames = 0;
+        setBigMicPill("dead");
+        audioSuspect = true; // the retained graph is a corpse — force a true rebuild
+        releaseAudio();
+        tryWarmOnLoad(); // warmWithRetry path: visible warn status if it keeps failing
+      }
+    } catch (e) {}
   }
 
   // Fire the mid-dictation interruption alarm IFF the AudioContext is still
@@ -2932,13 +2994,32 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
-    // Phone corpse-mic catch: a REUSED graph can be an iOS corpse (looks live,
-    // delivers silence) after a no-event reclaim, so the take would record pure
-    // silence. Probe the analyser before capture and rebuild if it reads flat
-    // zero. Only when the graph was reused (a fresh rebuild is already live) and
-    // only on the big-button surface, so a normal press pays nothing; the probe
-    // is fully best-effort and can never break the press.
-    if (audioReused && bigButtonActive()) await probeMicLive();
+    // Phone corpse-mic catch — EVERY press on the big-button surface (not just
+    // reused graphs: between takes the corpse guard sets audioSuspect, so most
+    // phone presses are FRESH graphs — and a fresh post-interruption iOS stream
+    // can itself be silent, the VPIO wall the echo-cancellation toggle did not
+    // fix). A live mic costs ~0 ms (frame-0 exit); a dead one gets ONE forced
+    // rebuild + re-probe, and if it is STILL dead the press fails LOUD **before
+    // capture** — never show REC on a mic that is provably delivering silence
+    // (the clinician would dictate the whole take into a corpse and lose it to
+    // the watchdog after the fact).
+    if (bigButtonActive()) {
+      let micAlive = await probeMicAlive();
+      if (!micAlive) {
+        audioSuspect = true; // skip the healthy-reuse fast path — force a true rebuild
+        try { releaseAudio(); await ensureAudio(); } catch (e) {}
+        micAlive = await probeMicAlive();
+      }
+      if (!micAlive) {
+        await writeSentinel();
+        setMicPill("fail");
+        setBigMicPill("dead");
+        setStatus("MIC NOT CAPTURING — the mic is delivering silence, so recording did NOT start (nothing was lost). Press again; if it repeats, relaunch the app." + recordMicFailure("precapture-dead-mic"), "err");
+        failBeep();
+        return;
+      }
+      setBigMicPill("ok");
+    }
     if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
     if (!audioCtx || audioCtx.state !== "running") {
       await writeSentinel();
@@ -4373,6 +4454,10 @@ right lower quadrant"></textarea>
     // leave unless a dictation is still mid-flight and wants it (wakeLockDesired).
     if (active) acquireWakeLock();
     else if (!wakeLockDesired()) releaseWakeLock();
+    // Idle mic-health sampling runs only while this surface is up (it exists for
+    // the between-takes iOS corpse); off it, clear the timer + pill.
+    if (active && !micIdleTimer) micIdleTimer = setInterval(micIdleSample, MIC_IDLE_PROBE_MS);
+    if (!active && micIdleTimer) { clearInterval(micIdleTimer); micIdleTimer = null; micIdleDeadFrames = 0; setBigMicPill(""); }
     if (!active) {
       document.body.classList.remove("bigbtn-settings");
       bigPeekExpanded = false;

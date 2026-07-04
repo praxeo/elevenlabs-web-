@@ -77,6 +77,13 @@
 //      diarize=false + skips client filtering + persists per-device
 //  25w. joined + degraded outcome: a large speaker-filter cut delivered over the
 //      relay gets warnBeep + VERIFY on the delivered ack — never doneBeep
+//  23p. phone corpse-mic probe (every press): a dead analyser read forces ONE
+//      pre-capture rebuild and a still-dead mic fails LOUD before capture (no
+//      REC, no upload, sentinel); a healthy mic exits on frame 0 (no rebuild)
+//  37. fresh-graph silent capture (the VPIO wall): a FRESH getUserMedia stream
+//      that delivers silence gets one rebuild then a loud pre-capture failure
+//  38. idle mic-health sampler: two consecutive dead idle frames proactively
+//      rebuild the retained graph (never mid-recording) + the Mic ✓/⚠ pill
 //  39. transcript-coverage guard: a result whose last word ends far short of the
 //      speech the gate observed (or whose decoded audio is far shorter than the
 //      recording) is a degraded WARN (text still delivered + diag ring entry),
@@ -2845,32 +2852,37 @@ console.log('--- scenario 33: iOS quiet-mic level seed ---');
 }
 
 // ===== Scenario 23p: phone corpse-mic probe (press-path mic health check) =====
-// On the big-button surface a REUSED audio graph can be an iOS corpse (track
-// reports "live"/unmuted but delivers pure silence after a no-event reclaim).
-// Before capture the press reads the analyser ONCE; a flat-zero read forces a
-// fresh getUserMedia so the user's words land on a live mic. A healthy mic always
-// shows a floor, so it pays nothing. micGranted -> the graph warms at boot
-// (audioSuspect false), so the FIRST press REUSES it (the corpse-risk path).
+// On the big-button surface the mic can be an iOS corpse (track reports
+// "live"/unmuted but delivers pure silence after a no-event reclaim) — a REUSED
+// graph or even a FRESH one (the VPIO wall). EVERY press probes the analyser
+// with a short settle window: a dead read forces one fresh getUserMedia, and a
+// mic that is STILL dead fails LOUD **before capture** — REC never starts on a
+// provably silent mic, so the clinician cannot dictate a take into it. A
+// healthy mic shows a floor on frame 0, so a normal press pays nothing.
+// micGranted -> the graph warms at boot (audioSuspect false), so the FIRST
+// press REUSES it (the classic corpse-risk path).
 console.log('--- scenario 23p: phone corpse-mic probe ---');
+const mkProbeDom = (onGum, settings) => new JSDOM(html, {
+  runScripts: 'dangerously', url: 'https://dictation.test/',
+  beforeParse(win) {
+    win.isSecureContext = true;
+    Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+    win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+    win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+    win.AudioContext = MockAudioCtx;
+    win.navigator.mediaDevices = { getUserMedia: () => { onGum(); return Promise.resolve({ getAudioTracks: () => [{ readyState: 'live', muted: false, enabled: true, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] }); }, addEventListener: () => {} };
+    win._fetches = 0;
+    win.fetch = () => { win._fetches++; return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":""}') }); }; // empty transcript -> the loud no-signal finalize
+    win._recStarts = 0;
+    win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { win._recStarts++; this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+    const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+    win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(settings || { micGranted: true, bigButtonMode: 'always' }));
+  },
+});
 {
-  const mkProbeDom = (onGum) => new JSDOM(html, {
-    runScripts: 'dangerously', url: 'https://dictation.test/',
-    beforeParse(win) {
-      win.isSecureContext = true;
-      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
-      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
-      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
-      win.AudioContext = MockAudioCtx;
-      win.navigator.mediaDevices = { getUserMedia: () => { onGum(); return Promise.resolve({ getAudioTracks: () => [{ readyState: 'live', muted: false, enabled: true, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] }); }, addEventListener: () => {} };
-      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":""}') }); // empty transcript -> the loud no-signal finalize
-      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
-      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
-      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true, bigButtonMode: 'always' }));
-    },
-  });
-
-  // (a) corpse mic (analyser flat zero) -> the probe forces a pre-capture rebuild,
-  //     and a still-dead mic then fails LOUD (never silently records nothing).
+  // (a) corpse mic (analyser flat zero) on a REUSED graph -> the probe settles
+  //     (~400 ms), forces ONE pre-capture rebuild, re-probes, and a still-dead
+  //     mic fails LOUD **before capture**: no REC, no upload, sentinel copied.
   let gumA = 0;
   const domA = mkProbeDom(() => { gumA++; });
   await sleep(140); // boot: micGranted warms the graph once (audioSuspect cleared)
@@ -2878,16 +2890,18 @@ console.log('--- scenario 23p: phone corpse-mic probe ---');
   docA.getElementById('apiKey').value = 'test-key';
   micRms = 0.0; // corpse: the analyser reads exact zeros
   const gumA0 = gumA;
-  docA.getElementById('recordBtn').click(); // start -> reuse -> probe reads zero -> rebuild
-  await sleep(120);
-  check('s23p: a corpse mic on the phone forces a pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
-  docA.getElementById('recordBtn').click(); // stop -> upload empty -> still zero -> loud failure
-  await sleep(300);
-  check('s23p: a still-dead mic then fails LOUD (MIC PRODUCED NO SIGNAL)', docA.getElementById('status').textContent.includes('MIC PRODUCED NO SIGNAL'), docA.getElementById('status').textContent);
-  check('s23p: the corpse take copies the sentinel', domA.window._clip === '##DICTATION_FAILED##', JSON.stringify(domA.window._clip));
+  const fetchesA0 = domA.window._fetches;
+  docA.getElementById('recordBtn').click(); // press -> probe settles -> rebuild -> re-probe -> loud pre-capture fail
+  await sleep(1300); // two settle windows (2 x 400 ms) + slack
+  check('s23p: a corpse mic forces exactly one pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
+  check('s23p: a still-dead mic fails LOUD before capture (MIC NOT CAPTURING, no REC)', docA.getElementById('status').textContent.includes('MIC NOT CAPTURING') && docA.getElementById('status').textContent.includes('did NOT start'), docA.getElementById('status').textContent);
+  check('s23p: the recorder never started on the dead mic', domA.window._recStarts === 0, 'recStarts ' + domA.window._recStarts);
+  check('s23p: nothing was uploaded for the dead press', domA.window._fetches === fetchesA0, 'fetches delta ' + (domA.window._fetches - fetchesA0));
+  check('s23p: the dead press copies the sentinel', domA.window._clip === '##DICTATION_FAILED##', JSON.stringify(domA.window._clip));
+  check('s23p: the dead press is a fail status', docA.getElementById('status').className.includes('err'), docA.getElementById('status').className);
 
-  // (b) a healthy mic always shows a floor -> the probe is a no-op (NO extra
-  //     getUserMedia), so a normal press pays nothing.
+  // (b) a healthy mic always shows a floor -> the probe exits on frame 0 (NO
+  //     extra getUserMedia, no settle wait), so a normal press pays nothing.
   let gumB = 0;
   const domB = mkProbeDom(() => { gumB++; });
   await sleep(140);
@@ -2898,8 +2912,66 @@ console.log('--- scenario 23p: phone corpse-mic probe ---');
   docB.getElementById('recordBtn').click(); // start -> reuse -> probe reads a floor -> NO rebuild
   await sleep(120);
   check('s23p: a healthy phone mic does NOT trigger a probe rebuild', gumB === gumB0, 'gum delta ' + (gumB - gumB0));
+  check('s23p: a healthy press starts recording promptly', domB.window._recStarts === 1, 'recStarts ' + domB.window._recStarts);
   docB.getElementById('recordBtn').click(); // clean up the take
   await sleep(200);
+  micRms = 0.05;
+}
+
+// ===== Scenario 37: FRESH-graph silent capture (the VPIO wall) =====
+// The reused-only probe missed this: after an iOS interruption even a FRESH
+// getUserMedia stream can deliver pure silence while looking live — and on the
+// phone surface most presses ARE fresh graphs (the between-takes corpse guard
+// sets audioSuspect). The press must probe the fresh graph too and fail LOUD
+// pre-capture when it is silent.
+console.log('--- scenario 37: fresh-graph silent capture fails loud BEFORE capture ---');
+{
+  let gum37 = 0;
+  // No micGranted seed: the graph is NOT warmed at boot, so the press builds a
+  // FRESH graph (gum #1), probes it, rebuilds once (gum #2), then fails loud.
+  const dom37 = mkProbeDom(() => { gum37++; }, { bigButtonMode: 'always' });
+  await sleep(140);
+  const doc37 = dom37.window.document;
+  doc37.getElementById('apiKey').value = 'test-key';
+  micRms = 0.0; // the fresh stream is silent (VPIO wall)
+  doc37.getElementById('recordBtn').click();
+  await sleep(1400); // fresh build + two settle windows
+  check('s37: a silent FRESH graph gets one rebuild then fails pre-capture', gum37 === 2, 'gum ' + gum37);
+  check('s37: the fresh-graph silent press is loud (MIC NOT CAPTURING)', doc37.getElementById('status').textContent.includes('MIC NOT CAPTURING'), doc37.getElementById('status').textContent);
+  check('s37: REC never started on the silent fresh graph', dom37.window._recStarts === 0, 'recStarts ' + dom37.window._recStarts);
+  check('s37: sentinel copied for the silent fresh press', dom37.window._clip === '##DICTATION_FAILED##', JSON.stringify(dom37.window._clip));
+  micRms = 0.05;
+}
+
+// ===== Scenario 38: idle mic-health sampler (big-button surface) =====
+// Between takes iOS can kill the retained mic with NO event. The idle sampler
+// reads one analyser frame every MIC_IDLE_PROBE_MS (4 s): two consecutive dead
+// frames -> proactive rebuild while idle (free) + the "Mic ⚠ rebuilding" pill;
+// a live mic shows "Mic ✓". It never runs mid-recording (sessions own the mic;
+// the watchdog covers them).
+console.log('--- scenario 38: idle mic-health sampler (proactive corpse rebuild) ---');
+{
+  let gum38 = 0;
+  const dom38 = mkProbeDom(() => { gum38++; });
+  await sleep(140); // boot warm (gum #1)
+  const doc38 = dom38.window.document;
+  doc38.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05;
+  doc38.getElementById('recordBtn').click(); // healthy press -> recording
+  await sleep(150);
+  check('s38: recording started for the mid-take leg', dom38.window._recStarts === 1, 'recStarts ' + dom38.window._recStarts);
+  micRms = 0.0; // the mic dies mid-take: the sampler must NOT rebuild during a session
+  const gumMid = gum38;
+  await sleep(4400); // one sampler tick while recording
+  check('s38: the sampler never rebuilds mid-recording', gum38 === gumMid, 'gum delta ' + (gum38 - gumMid));
+  doc38.getElementById('recordBtn').click(); // stop (empty take fails loud; not the point here)
+  await sleep(400);
+  const gumIdle = gum38;
+  await sleep(8800); // two idle sampler ticks with a dead mic -> proactive rebuild
+  check('s38: two dead idle frames trigger a proactive rebuild', gum38 === gumIdle + 1, 'gum delta ' + (gum38 - gumIdle));
+  micRms = 0.05; // the rebuilt mic is live again
+  await sleep(4400); // next idle tick sees the floor
+  check('s38: the pill reads Mic ✓ once a live floor is back', doc38.getElementById('bigMicPill').textContent.includes('Mic ✓'), doc38.getElementById('bigMicPill').textContent);
   micRms = 0.05;
 }
 
