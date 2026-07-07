@@ -38,19 +38,31 @@ const DELIVERY_RETAIN_MAX = 5;
 // URLs). A deployment without APP_PASSPHRASE (BYO-key self-host) has no shared
 // secret to check and keeps the code-only behavior.
 //
-// The rate caps are per-isolate and best-effort (a Map, not global state) —
-// they blunt code scanning and brute force and keep a scan from running up
-// Durable Object instantiation costs (both checks run BEFORE the DO stub is
-// created). A Cloudflare WAF rate rule on /api/session/* remains the robust,
-// global layer — configure one in the dashboard; this in-Worker bucket is the
-// zero-config floor. Caps are per-IP and sized for clinic NATs (many
-// clinicians share one hospital egress IP): the TOTAL cap only bounds abuse,
-// and the FAILS cap is only ever consulted for requests that failed auth, so a
-// stale/misconfigured client can never rate-limit a correctly-authed neighbor
-// on the same NAT.
+// Rate limiting is TWO layers, both keyed per-IP and sized for clinic NATs
+// (many clinicians share one hospital egress IP), both consulted BEFORE the DO
+// stub is created so a scan can't run up Durable Object instantiation costs:
+//
+//   1. The GLOBAL layer — Cloudflare's native Workers Rate Limiting binding
+//      (env.SESSION_RL / env.SESSION_FAIL_RL, provisioned in wrangler.toml).
+//      Its counters aggregate across every isolate in a Cloudflare location
+//      (eventually consistent), so it is the layer that actually bounds a
+//      distributed scan — the per-isolate Map below cannot, since a scan
+//      spread over many isolates gets a fresh Map each. This replaces the
+//      "configure a dashboard WAF rule" advice: a classic WAF Rate Limiting
+//      Rule needs a zone (this Worker is on *.workers.dev), whereas the
+//      binding ships in the repo and deploys with the code. It is best-effort
+//      + FAIL-OPEN: an unprovisioned binding or a limiter error must never
+//      500 a real delivery — the per-isolate cap + the auth gate remain.
+//   2. The PER-ISOLATE Map — a zero-dependency local backstop that still
+//      works when the binding is absent (e.g. a BYO self-host that never
+//      provisioned it) and blunts a single-isolate hammer instantly.
+//
+// The TOTAL cap only bounds abuse; the FAILS cap is only ever consulted for
+// requests that FAILED auth, so a stale/misconfigured client can never
+// rate-limit a correctly-authed neighbor on the same NAT.
 const LINK_RL_WINDOW_MS    = 60 * 1000;
-const LINK_RL_MAX_PER_IP   = 600; // all session-route hits per IP per window
-const LINK_RL_FAILS_PER_IP = 20;  // failed-auth attempts per IP per window
+const LINK_RL_MAX_PER_IP   = 600; // all session-route hits per IP per window (matches SESSION_RL)
+const LINK_RL_FAILS_PER_IP = 20;  // failed-auth attempts per IP per window (matches SESSION_FAIL_RL)
 const DELIVER_MAX_BYTES    = 100 * 1024; // /deliver body cap (a note is KBs; the ring persists to a single DO storage value)
 const linkRateBuckets = new Map(); // ip -> { resetAt, total, fails }
 
@@ -66,6 +78,27 @@ function linkRateBucket(ip) {
     linkRateBuckets.set(ip, bucket);
   }
   return bucket;
+}
+
+// Global limiter probe. Returns true only when a PRESENT limiter says "over
+// limit"; an absent binding or ANY error returns false (fail-open) so the
+// route falls through to the per-isolate backstop + auth gate — a limiter
+// hiccup can never turn a real dictation delivery into a 500.
+async function overGlobalRateLimit(limiter, key) {
+  if (!limiter || typeof limiter.limit !== "function") return false;
+  try {
+    const { success } = await limiter.limit({ key });
+    return success === false;
+  } catch {
+    return false;
+  }
+}
+
+function rateLimited429() {
+  return new Response(JSON.stringify({ error: "Rate limited — try again shortly." }), {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+  });
 }
 
 export class SessionRoom {
@@ -262,32 +295,35 @@ export default {
         return new Response("Invalid session code", { status: 400 });
       }
 
-      // Rate cap + shared-secret gate — both BEFORE any DO is instantiated,
+      // Rate cap + shared-secret gate — all BEFORE any DO is instantiated,
       // so a code scan can't run up Durable Object costs (and /status can't
       // serve as a free which-codes-are-live oracle). See the constants block
-      // at the top of the file.
+      // at the top of the file: layer 1 is the global (Cloudflare-backed)
+      // limiter, layer 2 the per-isolate Map backstop.
       const ip = request.headers.get("cf-connecting-ip") || "?";
+      // Layer 1 (global): the total-volume limiter aggregates across isolates,
+      // so it bounds a DISTRIBUTED scan the per-isolate Map can't. Fail-open.
+      if (await overGlobalRateLimit(env && env.SESSION_RL, ip)) {
+        return rateLimited429();
+      }
       const bucket = linkRateBucket(ip);
       bucket.total++;
       if (bucket.total > LINK_RL_MAX_PER_IP) {
-        return new Response(JSON.stringify({ error: "Rate limited — try again shortly." }), {
-          status: 429,
-          headers: { "content-type": "application/json", "retry-after": "30" },
-        });
+        return rateLimited429();
       }
       const linkPass = ((env && env.APP_PASSPHRASE) || "").trim();
       if (linkPass) {
         const given = (request.headers.get("x-phone-auth") || url.searchParams.get("auth") || "").trim();
         if (!given || !safeEqual(given, linkPass)) {
-          // Only FAILED auth touches the fails budget: a stale client spamming
+          // Only FAILED auth touches the fails budgets: a stale client spamming
           // bad credentials degrades to 429 without evaluating further, and a
-          // correctly-authed device on the same NAT is never affected.
+          // correctly-authed device on the same NAT is never affected. The
+          // global fail limiter (layer 1) is the distributed brute-force bound;
+          // the per-isolate fails counter (layer 2) is the local backstop.
           bucket.fails++;
-          if (bucket.fails > LINK_RL_FAILS_PER_IP) {
-            return new Response(JSON.stringify({ error: "Rate limited — try again shortly." }), {
-              status: 429,
-              headers: { "content-type": "application/json", "retry-after": "30" },
-            });
+          if (await overGlobalRateLimit(env && env.SESSION_FAIL_RL, ip) ||
+              bucket.fails > LINK_RL_FAILS_PER_IP) {
+            return rateLimited429();
           }
           return new Response(JSON.stringify({ error: "The phone link requires the access code on this server." }), {
             status: 401,

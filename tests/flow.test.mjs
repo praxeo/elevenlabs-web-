@@ -3686,6 +3686,40 @@ console.log('--- scenario 42: session-route auth + rate limit + size cap ---');
     if (r.status === 429) sawTotal429 = true;
   }
   check('s42f: per-IP total volume caps at 429', sawTotal429);
+
+  // (g) the GLOBAL Cloudflare rate-limit binding (env.SESSION_RL / SESSION_FAIL_RL).
+  // A stub limiter reports {success} and records its keys; the router must
+  // consult it BEFORE the DO, key it by client IP, spend the FAIL budget only
+  // on failed auth, and FAIL OPEN if the binding errors (a limiter hiccup must
+  // never 500 a real delivery).
+  const rlCalls = { total: [], fail: [] };
+  const mkLimiter = (sink, ok) => ({ limit: async ({ key }) => { sink.push(key); return { success: ok }; } });
+
+  // total-volume limiter says "over": even a correctly-authed request is 429'd,
+  // before the room, keyed by the caller's IP.
+  const roomBefore = roomCalls.length;
+  const envBlock = { ...env42, SESSION_RL: mkLimiter(rlCalls.total, false) };
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'sesame' }, ip: '7.7.7.1' }), envBlock);
+  check('s42g: the global total limiter 429s before the room', r.status === 429 && roomCalls.length === roomBefore, r.status + '/' + (roomCalls.length - roomBefore));
+  check('s42g: the global limiter is keyed by client IP', rlCalls.total[rlCalls.total.length - 1] === '7.7.7.1', rlCalls.total.join(','));
+
+  // total-volume limiter says "ok" -> the request flows through to the room.
+  const envOk = { ...env42, SESSION_RL: mkLimiter([], true), SESSION_FAIL_RL: mkLimiter(rlCalls.fail, true) };
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'sesame' }, ip: '7.7.7.2' }), envOk);
+  check('s42g: a permitted global check flows through to the room', r.status === 200, r.status);
+  check('s42g: the fail limiter is NOT spent on a SUCCESSFUL auth', rlCalls.fail.length === 0, rlCalls.fail.length);
+
+  // failed auth with the global fail limiter over-limit -> 429 (not 401).
+  const envFail = { ...env42, SESSION_RL: mkLimiter([], true), SESSION_FAIL_RL: mkLimiter(rlCalls.fail, false) };
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'wrong' }, ip: '7.7.7.3' }), envFail);
+  check('s42g: the global fail limiter escalates a bad-auth to 429', r.status === 429, r.status);
+  check('s42g: the fail limiter IS spent on a FAILED auth', rlCalls.fail.length === 1 && rlCalls.fail[0] === '7.7.7.3', rlCalls.fail.join(','));
+
+  // a THROWING limiter must fail open: a correctly-authed delivery still lands.
+  const roomBefore2 = roomCalls.length;
+  const envThrow = { ...env42, SESSION_RL: { limit: async () => { throw new Error('limiter down'); } } };
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/deliver', { method: 'POST', headers: { 'x-phone-auth': 'sesame' }, body: deliverBody, ip: '7.7.7.4' }), envThrow);
+  check('s42g: a throwing limiter FAILS OPEN (delivery still reaches the room)', r.status === 200 && roomCalls.length === roomBefore2 + 1, r.status + '/' + (roomCalls.length - roomBefore2));
 }
 
 // ===== Scenario 42c: the client sends link auth; a 401 is LOUD =====

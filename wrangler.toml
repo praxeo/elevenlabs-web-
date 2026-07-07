@@ -23,3 +23,23 @@ class_name = "SessionRoom"
 [[migrations]]
 tag = "v1"
 new_classes = ["SessionRoom"]
+
+# Native Workers Rate Limiting — the GLOBAL layer over the per-isolate Map in
+# worker.js (see the "Session-route protection" block there). Counters
+# aggregate across every isolate in a Cloudflare location (eventually
+# consistent), so they bound a distributed scan the per-isolate Map can't. The
+# Worker feature-detects these (env.SESSION_RL / env.SESSION_FAIL_RL) and
+# FAILS OPEN, so an account/plan without the binding still deploys and serves —
+# it just falls back to the per-isolate backstop + the auth gate.
+#   SESSION_RL      — all /api/session hits per IP  (limit matches LINK_RL_MAX_PER_IP)
+#   SESSION_FAIL_RL — failed-auth attempts per IP    (limit matches LINK_RL_FAILS_PER_IP)
+# period must be 10 or 60 (seconds). namespace_id is any per-account-unique int.
+[[ratelimits]]
+name = "SESSION_RL"
+namespace_id = "1001"
+simple = { limit = 600, period = 60 }
+
+[[ratelimits]]
+name = "SESSION_FAIL_RL"
+namespace_id = "1002"
+simple = { limit = 20, period = 60 }
