@@ -26,6 +26,48 @@ const DELIVERY_RETAIN_MS  = 30 * 60 * 1000;
 // several sends before its pong timeout unmasks it — each overwrote the slot).
 const DELIVERY_RETAIN_MAX = 5;
 
+// ── Session-route protection ────────────────────────────────────────────────
+// The 6-char session code ROUTES messages to a room; it must not also be the
+// only thing GUARDING them: an unauthenticated /deliver could plant attacker
+// text on a clinician's clipboard (silent wrong text on a chart — the exact
+// failure this app exists to prevent), and /latest would hand the held note to
+// anyone who guessed a live code. So when the deployment has APP_PASSPHRASE
+// set (shared mode), every /api/session route requires it — as the
+// x-phone-auth header on fetches, or ?auth= on the WebSocket upgrade (browsers
+// cannot set headers on a WS; see the sharp edge about never logging request
+// URLs). A deployment without APP_PASSPHRASE (BYO-key self-host) has no shared
+// secret to check and keeps the code-only behavior.
+//
+// The rate caps are per-isolate and best-effort (a Map, not global state) —
+// they blunt code scanning and brute force and keep a scan from running up
+// Durable Object instantiation costs (both checks run BEFORE the DO stub is
+// created). A Cloudflare WAF rate rule on /api/session/* remains the robust,
+// global layer — configure one in the dashboard; this in-Worker bucket is the
+// zero-config floor. Caps are per-IP and sized for clinic NATs (many
+// clinicians share one hospital egress IP): the TOTAL cap only bounds abuse,
+// and the FAILS cap is only ever consulted for requests that failed auth, so a
+// stale/misconfigured client can never rate-limit a correctly-authed neighbor
+// on the same NAT.
+const LINK_RL_WINDOW_MS    = 60 * 1000;
+const LINK_RL_MAX_PER_IP   = 600; // all session-route hits per IP per window
+const LINK_RL_FAILS_PER_IP = 20;  // failed-auth attempts per IP per window
+const DELIVER_MAX_BYTES    = 100 * 1024; // /deliver body cap (a note is KBs; the ring persists to a single DO storage value)
+const linkRateBuckets = new Map(); // ip -> { resetAt, total, fails }
+
+function linkRateBucket(ip) {
+  const now = Date.now();
+  // Opportunistic prune so a wide scan can't grow the map unbounded.
+  if (linkRateBuckets.size > 5000) {
+    for (const [k, b] of linkRateBuckets) if (now >= b.resetAt) linkRateBuckets.delete(k);
+  }
+  let bucket = linkRateBuckets.get(ip);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { resetAt: now + LINK_RL_WINDOW_MS, total: 0, fails: 0 };
+    linkRateBuckets.set(ip, bucket);
+  }
+  return bucket;
+}
+
 export class SessionRoom {
   constructor(state, env) {
     this.state = state || {};
@@ -219,17 +261,69 @@ export default {
       if (!code || code.length < 4 || code.length > 8) {
         return new Response("Invalid session code", { status: 400 });
       }
+
+      // Rate cap + shared-secret gate — both BEFORE any DO is instantiated,
+      // so a code scan can't run up Durable Object costs (and /status can't
+      // serve as a free which-codes-are-live oracle). See the constants block
+      // at the top of the file.
+      const ip = request.headers.get("cf-connecting-ip") || "?";
+      const bucket = linkRateBucket(ip);
+      bucket.total++;
+      if (bucket.total > LINK_RL_MAX_PER_IP) {
+        return new Response(JSON.stringify({ error: "Rate limited — try again shortly." }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "30" },
+        });
+      }
+      const linkPass = ((env && env.APP_PASSPHRASE) || "").trim();
+      if (linkPass) {
+        const given = (request.headers.get("x-phone-auth") || url.searchParams.get("auth") || "").trim();
+        if (!given || !safeEqual(given, linkPass)) {
+          // Only FAILED auth touches the fails budget: a stale client spamming
+          // bad credentials degrades to 429 without evaluating further, and a
+          // correctly-authed device on the same NAT is never affected.
+          bucket.fails++;
+          if (bucket.fails > LINK_RL_FAILS_PER_IP) {
+            return new Response(JSON.stringify({ error: "Rate limited — try again shortly." }), {
+              status: 429,
+              headers: { "content-type": "application/json", "retry-after": "30" },
+            });
+          }
+          return new Response(JSON.stringify({ error: "The phone link requires the access code on this server." }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        }
+      }
+
       if (!env || !env.SESSION_ROOM) {
         return new Response("Session rooms not available", { status: 503 });
       }
       const stub = env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(code));
-      // Desktop listener: WebSocket upgrade
+      // Desktop listener: WebSocket upgrade. (Forwarded as-is — the upgrade
+      // must ride the original request; the room ignores the query string.)
       if (request.headers.get("Upgrade") === "websocket") {
         return stub.fetch(request);
       }
-      // Phone delivery: relay final authoritative text to desktop listeners
+      // Phone delivery: relay final authoritative text to desktop listeners.
+      // Cap the body BEFORE it reaches the room: the ring persists to a single
+      // DO storage value (128 KiB limit) and every byte is broadcast to every
+      // listener — an unbounded body is an abuse lever, never a real note.
       if (request.method === "POST" && parts[4] === "deliver") {
+        const declared = parseInt(request.headers.get("content-length") || "0", 10);
+        if (declared > DELIVER_MAX_BYTES) {
+          return new Response(JSON.stringify({ error: "Delivery too large." }), {
+            status: 413,
+            headers: { "content-type": "application/json" },
+          });
+        }
         const body = await request.text();
+        if (body.length > DELIVER_MAX_BYTES) {
+          return new Response(JSON.stringify({ error: "Delivery too large." }), {
+            status: 413,
+            headers: { "content-type": "application/json" },
+          });
+        }
         return stub.fetch("https://session-room/broadcast", {
           method: "POST",
           body: body,
@@ -1313,6 +1407,8 @@ right lower quadrant"></textarea>
   let phoneFallbackTimer = null;  // desktop: grace timer before live-text fallback delivery
   let phonePollTimer    = null; // desktop: /latest poll-fallback interval (fires only while the WS is not OPEN)
   let statusPollTimer   = null; // phone: /status presence-poll interval (big-button surface only)
+  let linkAuthDenied    = false; // last session-route response was a 401 — names the cause in the loud failure paths
+  let linkAuthWarned    = false; // one-shot: the poll paths surface the 401 guidance once, not once per tick
   let lastDeliveryId    = "";   // desktop: most recent phone_delivery id (migrated into recentDeliveryIds)
   let recentDeliveryIds = [];   // desktop: ring of recent ids — dedupes BOTH room replays and retried/out-of-order re-POSTs
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
@@ -3952,7 +4048,7 @@ right lower quadrant"></textarea>
     try {
       fetch("/api/session/" + code + "/deliver", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: linkAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ message_type: "phone_join" }),
       }).catch(function () {});
     } catch (e) {}
@@ -3969,7 +4065,7 @@ right lower quadrant"></textarea>
     try {
       fetch("/api/session/" + joinedSessionCode + "/deliver", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: linkAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ message_type: "phone_recording", state: state }),
       }).catch(function () {});
     } catch (e) {}
@@ -4110,7 +4206,8 @@ right lower quadrant"></textarea>
     // Poll fallback: a no-op every tick the WS is OPEN; the safety net when it
     // is not (see pollLatestDeliveries).
     if (!phonePollTimer) phonePollTimer = setInterval(function () { pollLatestDeliveries(false); }, POLL_LATEST_MS);
-    setStatus(statusMsg, "ok");
+    var authWarn = linkAuthSetupWarning();
+    setStatus(statusMsg + authWarn, authWarn ? "err" : "ok");
   }
 
   // Boot restore: the codes persist in settings so an iOS PWA kill or a tab
@@ -4130,7 +4227,8 @@ right lower quadrant"></textarea>
       saveSettingsNow();
       try { history.replaceState(null, "", window.location.pathname); } catch (e) {}
       notifyDesktopOfJoin(joinParam); // a fresh QR scan: close the desktop's pairing overlay
-      setStatus("Joined session " + joinParam + " (scanned). Start recording to send audio to the desktop.", "ok");
+      var scanAuthWarn = linkAuthSetupWarning();
+      setStatus("Joined session " + joinParam + " (scanned). Start recording to send audio to the desktop." + scanAuthWarn, scanAuthWarn ? "err" : "ok");
     }
     if (phoneSessionCode) {
       beginPhoneSession("Phone session resumed (code " + phoneSessionCode + ").");
@@ -4151,11 +4249,50 @@ right lower quadrant"></textarea>
     updateQueueChip(); // undelivered notes surface immediately at boot, joined or not
   }
 
+  /* ── Phone-link auth ──
+     When this deployment runs in shared mode, the Worker requires the access
+     code on every /api/session route (see the server's session-route
+     protection block): fetches carry it as the x-phone-auth header; the
+     WebSocket cannot set headers, so it rides ?auth= on the upgrade URL (the
+     documented sharp edge: never log request URLs in the Worker). When the
+     user has no code saved these return empty and the server answers 401 —
+     the poll/delivery paths below turn that into a LOUD, named failure
+     (never a silent dead link). */
+  function linkAuthValue() {
+    return (passphraseEl && passphraseEl.value ? passphraseEl.value : "").trim();
+  }
+  function linkAuthHeaders(h) {
+    h = h || {};
+    var p = linkAuthValue();
+    if (p) h["x-phone-auth"] = p;
+    return h;
+  }
+  function linkAuthQuery() {
+    var p = linkAuthValue();
+    return p ? "?auth=" + encodeURIComponent(p) : "";
+  }
+  // Missing-code warning for the join/pair statuses: catching it at link setup
+  // beats diagnosing 401s after the first dictation already needed delivering.
+  function linkAuthSetupWarning() {
+    return (SHARED_MODE && !linkAuthValue())
+      ? " ⚠ This server requires the access code for the phone link — enter it under Access, or deliveries will be refused."
+      : "";
+  }
+  // A 401 from a background poll: surface the fix once, loudly, without
+  // stomping a live dictation's status line (the delivery path carries its
+  // own named failure).
+  function noteLinkAuthDenied(where) {
+    linkAuthDenied = true;
+    if (linkAuthWarned || recording || stopping || finishing) return;
+    linkAuthWarned = true;
+    setStatus("⚠ " + where + " was REFUSED: this server requires the access code for the phone link. Enter it under Access — nothing delivers until then.", "err");
+  }
+
   function connectPhoneSessionWs() {
     var code = phoneSessionCode;
     if (!code) return;
     var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    var ws = new WebSocket(proto + "//" + window.location.host + "/api/session/" + code);
+    var ws = new WebSocket(proto + "//" + window.location.host + "/api/session/" + code + linkAuthQuery());
     phoneSessionWs = ws;
 
     ws.onopen = function() {
@@ -4211,8 +4348,15 @@ right lower quadrant"></textarea>
     if (!joinedSessionCode || !bigButtonActive()) { setDesktopPill(null); return; }
     if (document.visibilityState !== "visible") return;
     try {
-      var res = await fetch("/api/session/" + joinedSessionCode + "/status");
-      if (!res.ok) { setDesktopPill(null); return; }
+      var res = await fetch("/api/session/" + joinedSessionCode + "/status", { headers: linkAuthHeaders() });
+      if (!res.ok) {
+        // A 401 means every delivery would be refused too — name the fix now,
+        // BEFORE the clinician dictates into a link that cannot deliver.
+        if (res.status === 401) noteLinkAuthDenied("Desktop presence check");
+        setDesktopPill(null);
+        return;
+      }
+      linkAuthDenied = false; linkAuthWarned = false; // an accepted request clears the guidance latch
       var data = JSON.parse(await res.text());
       if (!data || typeof data.listeners !== "number") { setDesktopPill(null); return; }
       setDesktopPill(data.listeners > 0);
@@ -4266,8 +4410,16 @@ right lower quadrant"></textarea>
     if (!phoneSessionCode) return;
     if (!force && phoneSessionWs && phoneSessionWs.readyState === 1) return;
     try {
-      var res = await fetch("/api/session/" + phoneSessionCode + "/latest");
-      if (!res.ok) return;
+      var res = await fetch("/api/session/" + phoneSessionCode + "/latest", { headers: linkAuthHeaders() });
+      if (!res.ok) {
+        // The WS never surfaces WHY an upgrade failed (a 401 closes like any
+        // drop) — this poll runs exactly while the WS is down, so it is the
+        // desktop's one place to name an auth refusal instead of red-badging
+        // forever as a mystery "reconnecting".
+        if (res.status === 401) noteLinkAuthDenied("Phone-link listener");
+        return;
+      }
+      linkAuthDenied = false; linkAuthWarned = false;
       var data = JSON.parse(await res.text());
       // New workers return the full fresh ring; an old worker only the newest.
       var list = Array.isArray(data.deliveries) ? data.deliveries : (data.delivery ? [data.delivery] : []);
@@ -4535,10 +4687,17 @@ right lower quadrant"></textarea>
       var res = await fetch("/api/session/" + code + "/deliver", {
         method: "POST",
         body: payload,
-        headers: { "Content-Type": "application/json" },
+        headers: linkAuthHeaders({ "Content-Type": "application/json" }),
         signal: ctrl ? ctrl.signal : undefined,
       });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) {
+        // Remember an auth refusal so the outcome cue can NAME the fix (enter
+        // the access code) instead of a generic "relay failed". The item stays
+        // queued either way — a 401 never costs the text.
+        if (res.status === 401) linkAuthDenied = true;
+        throw new Error("HTTP " + res.status);
+      }
+      linkAuthDenied = false; linkAuthWarned = false;
       var listeners = -1;
       try { listeners = JSON.parse(await res.text()).listeners; } catch (e) { listeners = -1; }
       return listeners > 0 ? "delivered" : "buffered";
@@ -4708,8 +4867,12 @@ right lower quadrant"></textarea>
       setStatus("⚠ Desktop link is DOWN — transcript queued; it delivers when the desktop reconnects. VERIFY it lands before pasting!", "err");
       warnBeep();
     } else {
-      // POST failed/timed out: link down. Loud, and queued for retry.
-      setStatus("⚠ Desktop relay FAILED — transcript queued; it retries when the link is back. It has NOT reached the desktop yet!", "err");
+      // POST failed/timed out: link down. Loud, and queued for retry. When the
+      // failure was an auth refusal, say exactly what unblocks it.
+      var authNote = linkAuthDenied
+        ? " This server requires the ACCESS CODE for the phone link — enter it under Access, then tap the queue chip to retry."
+        : "";
+      setStatus("⚠ Desktop relay FAILED — transcript queued; it retries when the link is back. It has NOT reached the desktop yet!" + authNote, "err");
       failBeep();
     }
   }
@@ -5066,7 +5229,8 @@ right lower quadrant"></textarea>
     updateQueueChip();
     updateAppendChip(); // the manual "Send to desktop" button appears when joined
     renderHistory();    // history rows gain their per-row send buttons
-    setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
+    var joinAuthWarn = linkAuthSetupWarning();
+    setStatus("Joined session " + code + ". Start recording to send audio to the desktop." + joinAuthWarn, joinAuthWarn ? "err" : "ok");
     // The self-heal moment for a stranded note: (re)joining the code its items
     // are bound to flushes them right away — no waiting on the backoff timer.
     if (deliveryQueue.length) backgroundFlush();
