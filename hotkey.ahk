@@ -24,6 +24,10 @@ SENTINEL       := "##DICTATION_FAILED##"   ; must match the browser's marker
 ; no browser focus needed. Leave PHONE_CODE empty to disable.
 PHONE_POLL_URL := ""           ; e.g. "https://eleven.example.workers.dev" (no trailing slash)
 PHONE_CODE     := ""           ; 6-char session code from the desktop page
+PHONE_AUTH     := ""           ; access code (same one the app's Access section uses) —
+                               ; REQUIRED when the worker runs in shared mode: the session
+                               ; routes answer 401 without it. Leave empty for a BYO-key
+                               ; deploy with no APP_PASSPHRASE set.
 PHONE_POLL_MS  := 2000
 ; ==================
 
@@ -38,7 +42,7 @@ if (PHONE_POLL_URL != "" && PHONE_CODE != "")
     SetTimer(PollPhoneDelivery, PHONE_POLL_MS)
 
 PollPhoneDelivery() {
-    global PHONE_POLL_URL, PHONE_CODE, LAST_DELIVERY_ID, POLL_SEEDED
+    global PHONE_POLL_URL, PHONE_CODE, PHONE_AUTH, LAST_DELIVERY_ID, POLL_SEEDED
     global BUSY, STRIP_NEWLINES, TRAILING_SPACE
     static polling := false
     if (polling || BUSY)               ; never fight the PTT clipboard handshake
@@ -47,6 +51,8 @@ PollPhoneDelivery() {
     try {
         req := ComObject("WinHttp.WinHttpRequest.5.1")
         req.Open("GET", PHONE_POLL_URL "/api/session/" PHONE_CODE "/latest", true)
+        if (PHONE_AUTH != "")
+            req.SetRequestHeader("x-phone-auth", PHONE_AUTH)
         req.Send()
         req.WaitForResponse(5)
         body := req.ResponseText

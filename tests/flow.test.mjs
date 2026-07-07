@@ -113,6 +113,14 @@
 //      old flat 15 s deadline and still succeeds
 //  41. journal cap honesty: a recovery capped at JOURNAL_MAX_CHUNKS says only
 //      the first ~N minutes were saved; an uncapped one doesn't
+//  42. session-route protection: with APP_PASSPHRASE set, /deliver, /latest,
+//      /status and the WS upgrade all 401 without the access code (header
+//      x-phone-auth or ?auth=), never touching the DO; failed auth from one IP
+//      escalates to 429; oversized /deliver bodies 413; a no-passphrase deploy
+//      stays open (BYO back-compat). Client side (shared-mode page): the WS
+//      URL carries ?auth=, delivery/status/latest fetches carry the header, a
+//      401'd delivery fails LOUD naming the access code and stays queued, and
+//      starting/joining the link without a saved code warns immediately
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -3593,6 +3601,200 @@ console.log('--- scenario 41: journal cap honesty ---');
   const shownOk = domOk.window.document.getElementById('journalRecover').style.display !== 'none';
   check('s41b: an uncapped recovery banner shows', shownOk, 'display=' + domOk.window.document.getElementById('journalRecover').style.display);
   check('s41b: an uncapped recovery has no partial-save note', !msgOk.includes('first 30 minutes'), msgOk);
+}
+
+// ===== Scenario 42: session-route protection (Worker router) =====
+// The 6-char code routes; the access code GUARDS. With APP_PASSPHRASE set,
+// every /api/session route requires it — checked before any DO exists, so a
+// code scan can't read notes, forge deliveries, oracle /status, or run up DO
+// instantiation costs. A deploy without APP_PASSPHRASE keeps code-only access.
+console.log('--- scenario 42: session-route auth + rate limit + size cap ---');
+{
+  const roomCalls = [];
+  const fakeNs = {
+    idFromName: (n) => n,
+    get: () => ({
+      fetch: async (req) => {
+        roomCalls.push(typeof req === 'string' ? req : String(req.url));
+        return new Response(JSON.stringify({ ok: true, listeners: 1 }), { headers: { 'content-type': 'application/json' } });
+      },
+    }),
+  };
+  // Duck-typed requests (like scenario 21's) so the WS-upgrade path can be
+  // exercised without WebSocketPair, and headers/IP are fully controlled.
+  const mkReq = (path, o) => {
+    o = o || {};
+    const hdrs = {};
+    for (const k of Object.keys(o.headers || {})) hdrs[k.toLowerCase()] = o.headers[k];
+    if (!hdrs['cf-connecting-ip']) hdrs['cf-connecting-ip'] = o.ip || '9.9.9.1';
+    return {
+      url: 'https://dictation.test' + path,
+      method: o.method || 'GET',
+      headers: { get: (h) => hdrs[String(h).toLowerCase()] || null },
+      text: async () => o.body || '',
+    };
+  };
+  const env42 = { SESSION_ROOM: fakeNs, APP_PASSPHRASE: 'sesame', ELEVENLABS_API_KEY: 'srv-key' };
+  const deliverBody = '{"message_type":"phone_delivery","text":"x","delivery_id":"d1"}';
+
+  // (a) no auth -> 401 on every route, and the DO is never instantiated
+  let r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest'), env42);
+  check('s42a: /latest without auth is 401', r.status === 401, r.status);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/deliver', { method: 'POST', body: deliverBody }), env42);
+  check('s42a: /deliver without auth is 401', r.status === 401, r.status);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/status'), env42);
+  check('s42a: /status without auth is 401 (no live-code oracle)', r.status === 401, r.status);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01', { headers: { Upgrade: 'websocket' } }), env42);
+  check('s42a: WS upgrade without auth is 401', r.status === 401, r.status);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'wrong' } }), env42);
+  check('s42a: wrong auth is 401', r.status === 401, r.status);
+  check('s42a: unauthenticated requests never reach the room', roomCalls.length === 0, roomCalls.length);
+
+  // (b) right auth passes — header (fetches) and ?auth= (the WS path)
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'sesame' } }), env42);
+  check('s42b: header auth reaches the room', r.status === 200 && roomCalls.length === 1, r.status + '/' + roomCalls.length);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest?auth=sesame'), env42);
+  check('s42b: query-param auth reaches the room (WS cannot set headers)', r.status === 200 && roomCalls.length === 2, r.status + '/' + roomCalls.length);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/deliver', { method: 'POST', headers: { 'x-phone-auth': 'sesame' }, body: deliverBody }), env42);
+  check('s42b: authed /deliver flows through', r.status === 200 && roomCalls.length === 3, r.status + '/' + roomCalls.length);
+
+  // (c) oversized /deliver is rejected before the room (persisted ring + broadcast abuse lever)
+  const bigBody = '{"message_type":"phone_delivery","text":"' + 'A'.repeat(120 * 1024) + '","delivery_id":"d2"}';
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/deliver', { method: 'POST', headers: { 'x-phone-auth': 'sesame' }, body: bigBody }), env42);
+  check('s42c: an oversized /deliver is 413 and never reaches the room', r.status === 413 && roomCalls.length === 3, r.status + '/' + roomCalls.length);
+
+  // (d) a deploy with no APP_PASSPHRASE keeps the code-only behavior (BYO self-host)
+  const before = roomCalls.length;
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { ip: '9.9.9.2' }), { SESSION_ROOM: fakeNs });
+  check('s42d: without APP_PASSPHRASE the routes stay open', r.status === 200 && roomCalls.length === before + 1, r.status);
+
+  // (e) failed auth from one IP escalates to 429; a VALID request from the
+  // same IP is unaffected (the fails budget is only consulted on failed auth)
+  let last = 0;
+  for (let i = 0; i < 30; i++) {
+    r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { ip: '9.9.9.3' }), env42);
+    last = r.status;
+  }
+  check('s42e: repeated failed auth escalates to 429', last === 429, last);
+  r = await worker.default.fetch(mkReq('/api/session/AUTH01/latest', { headers: { 'x-phone-auth': 'sesame' }, ip: '9.9.9.3' }), env42);
+  check('s42e: valid auth still passes from that IP', r.status === 200, r.status);
+
+  // (f) the per-IP total-volume cap answers 429 (bounds DO-instantiation cost)
+  let sawTotal429 = false;
+  for (let i = 0; i < 650 && !sawTotal429; i++) {
+    r = await worker.default.fetch(mkReq('/api/session/AUTH01/status', { headers: { 'x-phone-auth': 'sesame' }, ip: '9.9.9.4' }), env42);
+    if (r.status === 429) sawTotal429 = true;
+  }
+  check('s42f: per-IP total volume caps at 429', sawTotal429);
+}
+
+// ===== Scenario 42c: the client sends link auth; a 401 is LOUD =====
+console.log('--- scenario 42c: client link auth + loud 401 ---');
+{
+  const resShared = await worker.default.fetch(new Request('https://dictation.test/'), { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame' });
+  const htmlShared = await resShared.text();
+
+  // (a) desktop, shared mode, NO saved access code: starting the phone session
+  // warns loudly at setup time (not after the first refused delivery), and the
+  // WS URL carries no auth (nothing to send).
+  const socks42 = [];
+  const dom42 = new JSDOM(htmlShared, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true}') });
+      const Sock = class extends MockWS { constructor(url) { super(url); socks42.push(this); } };
+      Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+      win.WebSocket = Sock;
+    },
+  });
+  await sleep(180);
+  const doc42 = dom42.window.document;
+  const st42 = () => doc42.getElementById('status').textContent;
+  doc42.getElementById('phoneStartBtn').click();
+  await sleep(30);
+  check('s42c-a: starting the link without the access code warns loudly',
+    st42().includes('requires the access code') && doc42.getElementById('status').className.includes('err'), st42());
+  const bareSock = socks42.find((s) => s.url.includes('/api/session/'));
+  check('s42c-a: no auth query rides the WS when no code is saved', bareSock && bareSock.url.indexOf('auth=') === -1, bareSock && bareSock.url);
+
+  // (b) with the code saved, a fresh session's WS upgrade carries ?auth=
+  doc42.getElementById('phoneStopBtn').click();
+  doc42.getElementById('passphrase').value = 'sesame';
+  doc42.getElementById('phoneStartBtn').click();
+  await sleep(30);
+  const authedSock = socks42.filter((s) => s.url.includes('/api/session/')).pop();
+  check('s42c-b: the listener WS carries ?auth=', authedSock && authedSock.url.includes('?auth=sesame'), authedSock && authedSock.url);
+  check('s42c-b: with the code saved the start status is clean', !st42().includes('requires the access code'), st42());
+
+  // (c) joined phone: the /status poll and the delivery POST carry the header;
+  // a 401'd delivery fails LOUD (naming the access code) and stays queued.
+  const fetch42p = [];
+  let deliver42p = 'ok'; // 'ok' | '401'
+  const dom42p = new JSDOM(htmlShared, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener: () => {} };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.fetch = (url, opts) => {
+        const u = String(url);
+        fetch42p.push({ url: u, opts: opts || {} });
+        if (u.includes('/deliver')) {
+          if (deliver42p === '401') return Promise.resolve({ ok: false, status: 401, text: () => Promise.resolve('{"error":"auth"}') });
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        if (u.includes('/status')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1,"buffered":0}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Auth take."}') });
+      };
+      // saveApiKey:true — credentials only restore from localStorage when the
+      // user opted to remember them (same gate the real app applies).
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'AUTH42', micGranted: true, saveApiKey: true }));
+      win.localStorage.setItem('scribe_v2_passphrase_v9', 'sesame');
+    },
+  });
+  await sleep(200);
+  const doc42p = dom42p.window.document;
+  const st42p = () => doc42p.getElementById('status').textContent;
+  const hdr = (c) => (c.opts && c.opts.headers && c.opts.headers['x-phone-auth']) || '';
+  const statusPoll = fetch42p.find((c) => c.url.includes('/api/session/AUTH42/status'));
+  check('s42c-c: the boot /status poll carries the auth header', statusPoll && hdr(statusPoll) === 'sesame', statusPoll && JSON.stringify(statusPoll.opts.headers));
+
+  micRms = 0.05;
+  doc42p.getElementById('recordBtn').click();
+  await sleep(120);
+  doc42p.getElementById('recordBtn').click();
+  await sleep(500);
+  const deliverCall = fetch42p.find((c) => c.url.includes('/api/session/AUTH42/deliver') && String(c.opts.body || '').includes('phone_delivery'));
+  check('s42c-c: the delivery POST carries the auth header', deliverCall && hdr(deliverCall) === 'sesame', deliverCall && JSON.stringify(deliverCall.opts.headers));
+  check('s42c-c: the authed delivery lands (Done!)', st42p().includes('Done!'), st42p());
+
+  // the 401 leg: refused delivery -> loud, names the fix, text stays queued
+  deliver42p = '401';
+  doc42p.getElementById('recordBtn').click();
+  await sleep(120);
+  doc42p.getElementById('recordBtn').click();
+  await sleep(600);
+  check('s42c-c: a 401 delivery fails LOUD naming the access code',
+    st42p().includes('ACCESS CODE') && doc42p.getElementById('status').className.includes('err'), st42p());
+  const chip42 = doc42p.getElementById('bigQueueChip');
+  check('s42c-c: the refused note stays queued (chip visible)', chip42.style.display !== 'none' && chip42.textContent.includes('waiting to send'), chip42.textContent);
+
+  // heal: auth accepted again -> the queue chip tap delivers and clears
+  deliver42p = 'ok';
+  chip42.click();
+  await sleep(300);
+  check('s42c-c: after auth heals, the queued note delivers and the chip clears', chip42.style.display === 'none', chip42.style.display);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
