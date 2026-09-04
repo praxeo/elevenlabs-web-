@@ -12,6 +12,24 @@ Realtime is **out of scope** — it stays archived in `REALTIME_HANDOFF.md`. Thi
 supersedes the archived `LATENCY_PLAN.md`, which was written for the hybrid finalize path
 that no longer exists.
 
+> **Status: Phases 0 and 1 have shipped.** What is now live: the per-take timing ring with
+> a `Server-Timing` transport-vs-inference split (Advanced readout + TSV export, `?perf=1`),
+> the whole-window recording cue with title/favicon/badge, the AutoHotkey focus return +
+> always-on-top state bar + `MIN_HOLD` 350→200 ms, and the gate look-ahead (120 ms) with
+> release tail (80 ms). Covered by scenarios **43, 44, 45**.
+>
+> **One regression worth remembering:** the capture tail leaves `recording` true while the
+> delay line drains, and the F14 branch tested `recording || stopRequested` *before*
+> anything else — so an F13 queued during the tail was no longer cancelled by the following
+> F14, which would have started a session after the last F14 and opened a mic nobody was
+> holding. Scenario 25b caught it; F14 now tests `stopping || finishing` first. The pointer
+> and in-app hotkey release paths already guarded on that. **Any future change that extends
+> the window between release and finalize must re-check every release path against the
+> F13/F14 contract.**
+>
+> **Phase 2 is the next step, but only after the ring has real numbers on it** — the
+> Phase 0 A/Bs in §0.4 are what decide whether Phases 3 and 4 are worth building at all.
+
 Everything here is subordinate to the prime directive: **failures must be loud, and a
 dictation must never be lost.** Any step that widens a loss window is rejected, and the
 hard invariants in `CLAUDE.md` (F13/F14, the sentinel, one delivery per session, the
@@ -63,7 +81,7 @@ audio.
 
 ---
 
-## Phase 0 — Instrument before optimizing
+## Phase 0 — Instrument before optimizing  ✅ LANDED
 
 **Goal:** replace the table in §0 with per-take measured numbers from the actual work
 machine and network, exportable.
@@ -133,7 +151,7 @@ inference. If it is >70 %, Phases 3 and 4 are mostly futile and the plan ends at
 
 ---
 
-## Phase 1 — The certain wins (indicator + human tail + word boundaries)
+## Phase 1 — The certain wins (indicator + human tail + word boundaries)  ✅ LANDED
 
 Independent of the STT contract; ships as one PR with Phase 0.
 

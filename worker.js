@@ -388,8 +388,18 @@ export default {
 // forwards it to ElevenLabs batch Scribe v2. Serves pure batch mode and the
 // hybrid mode's accuracy re-transcription pass.
 async function handleTranscribeBatch(request, env) {
+  // [PERF] Stage stamps behind the Server-Timing response header the client
+  // folds into its timing ring. This is what splits OUR transport + proxy cost
+  // from ElevenLabs inference — the measurement the whole latency plan turns
+  // on. Durations ONLY: never log the request URL or the body, both of which
+  // carry the shared passphrase (see CLAUDE.md, Known sharp edges).
+  const tStart = Date.now();
+  let tParsed = tStart;
+  let tElStart = 0;
+  let tElEnd = 0;
   try {
     const incoming = await request.formData();
+    tParsed = Date.now();
 
     const clientKey  = String(incoming.get("api_key") || "").trim();
     const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
@@ -461,6 +471,7 @@ async function handleTranscribeBatch(request, env) {
       form.append("keyterms", term);
     }
 
+    tElStart = Date.now();
     const eleven = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
       method: "POST",
       headers: { "xi-api-key": apiKey },
@@ -468,6 +479,7 @@ async function handleTranscribeBatch(request, env) {
     });
 
     const responseText = await eleven.text();
+    tElEnd = Date.now();
 
     return new Response(responseText, {
       status: eleven.status,
@@ -475,6 +487,11 @@ async function handleTranscribeBatch(request, env) {
         "content-type":
           eleven.headers.get("content-type") || "application/json; charset=utf-8",
         "cache-control": "no-store",
+        // parse = buffering/re-serializing the upload in the Worker;
+        // el = the ElevenLabs round trip (upload + inference + response).
+        "server-timing": "parse;dur=" + (tParsed - tStart) +
+                         ", el;dur=" + (tElEnd - tElStart) +
+                         ", worker;dur=" + (Date.now() - tStart),
       },
     });
   } catch (err) {
@@ -562,9 +579,9 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="theme-color" content="#0b0d10" />
+  <meta id="themeColorMeta" name="theme-color" content="#0b0d10" />
   <link rel="manifest" href="/manifest.webmanifest" />
-  <link rel="icon" type="image/png" href="/icon-192.png" />
+  <link id="faviconLink" rel="icon" type="image/png" href="/icon-192.png" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>ElevenLabs Scribe v2 Dictation</title>
   <style>
@@ -753,6 +770,39 @@ const INDEX_HTML = `<!doctype html>
       padding: 2px 6px; font-size: 12px; color: var(--text);
     }
     .divider { height: 1px; background: var(--line); margin: 18px 0 14px; }
+    /* [UI] Window-wide state cue for a shrunk PWA window on a machine with no
+       speakers. "full" repaints the whole window so any visible sliver of it
+       reads at a glance; "border" draws an edge frame only; "off" disables it.
+       Never applied under .bigbtn — the phone overlay has its own screen state. */
+    body { transition: background-color .18s ease; }
+    body.tint-full[data-state="rec"]:not(.bigbtn)     { background: #430f0f; }
+    body.tint-full[data-state="busy"]:not(.bigbtn)    { background: #3a2a06; }
+    body.tint-full[data-state="ok"]:not(.bigbtn)      { background: #0c2b18; }
+    body.tint-full[data-state="warn"]:not(.bigbtn)    { background: #3a2a06; }
+    body.tint-full[data-state="fail"]:not(.bigbtn),
+    body.tint-full[data-state="alarm"]:not(.bigbtn)   { background: #4a0f0f; }
+    #stateEdge {
+      position: fixed; inset: 0; pointer-events: none; z-index: 60;
+      border: 0 solid transparent; transition: border-color .18s, border-width .18s;
+    }
+    body.tint-border[data-state="rec"]:not(.bigbtn)   #stateEdge { border-width: 7px; border-color: var(--danger); }
+    body.tint-border[data-state="busy"]:not(.bigbtn)  #stateEdge { border-width: 7px; border-color: var(--warn); }
+    body.tint-border[data-state="warn"]:not(.bigbtn)  #stateEdge { border-width: 7px; border-color: var(--warn); }
+    body.tint-border[data-state="ok"]:not(.bigbtn)    #stateEdge { border-width: 7px; border-color: var(--ok); }
+    body.tint-border[data-state="fail"]:not(.bigbtn),
+    body.tint-border[data-state="alarm"]:not(.bigbtn) #stateEdge { border-width: 7px; border-color: var(--danger); }
+    /* Recording is the one state worth a moving cue: a static red can be mistaken
+       for a theme. Respects prefers-reduced-motion. */
+    @keyframes stateEdgePulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+    body.tint-full[data-state="rec"]:not(.bigbtn)   #stateEdge,
+    body.tint-border[data-state="rec"]:not(.bigbtn) #stateEdge {
+      border-width: 7px; border-color: var(--danger); animation: stateEdgePulse 1.4s ease-in-out infinite;
+    }
+    @media (prefers-reduced-motion: reduce) { #stateEdge { animation: none !important; } }
+    #timingReadout {
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--muted); white-space: pre-wrap; word-break: break-word; margin-top: 6px;
+    }
     /* Tiny/minimized app window: shed chrome so record + status + transcript
        stay usable; everything else lives in the collapsible sections. */
     @media (max-width: 600px), (max-height: 600px) {
@@ -1021,6 +1071,18 @@ const INDEX_HTML = `<!doctype html>
             <button id="phoneLeaveBtn" style="display:none;">Leave</button>
           </div>
 
+          <label for="windowTint">Recording cue for a small window (per device)</label>
+          <select id="windowTint">
+            <option value="full" selected>Colour the whole window</option>
+            <option value="border">Edge frame only</option>
+            <option value="off">Off</option>
+          </select>
+          <div class="hint" style="margin: 6px 0 4px;">
+            Makes the recording state readable when the window is shrunk beside Cerner and
+            the machine has no speakers: red while recording, amber while uploading, green
+            on success, red on failure. The tab title, favicon and taskbar badge follow too.
+          </div>
+
           <label for="bigButtonMode">Big-button layout (per device)</label>
           <select id="bigButtonMode">
             <option value="joined" selected>When joined to a desktop session</option>
@@ -1080,6 +1142,14 @@ right lower quadrant"></textarea>
             Auto gain control <span class="hint">(off by default. Turn on to let the browser auto‑boost a quiet mic — easier than the slider, but can pump on a close mic.)</span>
           </label>
 
+          <label for="gateLookahead">Gate look-ahead <span class="sliderval" id="gateLookaheadVal"></span></label>
+          <input id="gateLookahead" type="range" min="0" max="300" step="10" value="120" />
+          <div class="hint">Delays only the RECORDED audio, so the gate opens just before the word starts instead of just after. Recovers clipped word beginnings (f, s, h, p, t sounds are quiet and open the gate late). Costs this many ms of extra delay per dictation. 0 = off.</div>
+
+          <label for="releaseTail">Release tail <span class="sliderval" id="releaseTailVal"></span></label>
+          <input id="releaseTail" type="range" min="0" max="300" step="10" value="80" />
+          <div class="hint">Keeps capturing this long after you let go, so a fast release cannot cut the last syllable. 0 = off.</div>
+
           <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
 
           <label class="checkbox">
@@ -1117,6 +1187,14 @@ right lower quadrant"></textarea>
             </div>
           </div>
 
+          <label style="margin-top:14px;">Last take timing</label>
+          <div id="timingReadout">No takes recorded yet.</div>
+          <div class="row" style="margin-top: 8px;">
+            <button id="copyTimingBtn" title="Copy the recent per-take timing log as TSV (paste into a spreadsheet)">Copy timing log</button>
+            <button id="clearTimingBtn" title="Clear the stored timing log for this device">Clear timing log</button>
+          </div>
+          <div class="hint">Where each dictation's time actually goes, measured on this machine and network. <b>service</b> is the round trip to the transcription API; the <b>ElevenLabs</b> figure inside it is what the API itself spent, so <b>net</b> is our own network overhead. Add <code>?perf=1</code> to the URL to also log each take to the console.</div>
+
           <h3>How do these settings work?</h3>
           <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. With a close mic, raising the open threshold rejects quieter, more distant voices before they're ever recorded.</p>
           <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
@@ -1143,6 +1221,8 @@ right lower quadrant"></textarea>
       </div>
     </section>
   </div>
+
+  <div id="stateEdge" aria-hidden="true"></div>
 
   <!-- Big-button dictation layout: hidden unless body.bigbtn (see CSS).
        A fixed overlay — the normal page above stays untouched for desktops. -->
@@ -1285,6 +1365,17 @@ right lower quadrant"></textarea>
   const highpassValEl    = document.getElementById("highpassVal");
   const micGainEl        = document.getElementById("micGain");
   const micGainValEl     = document.getElementById("micGainVal");
+  const gateLookaheadEl    = document.getElementById("gateLookahead");
+  const gateLookaheadValEl = document.getElementById("gateLookaheadVal");
+  const releaseTailEl      = document.getElementById("releaseTail");
+  const releaseTailValEl   = document.getElementById("releaseTailVal");
+  const windowTintEl       = document.getElementById("windowTint");
+  const timingReadoutEl    = document.getElementById("timingReadout");
+  const copyTimingBtn      = document.getElementById("copyTimingBtn");
+  const clearTimingBtn     = document.getElementById("clearTimingBtn");
+  const faviconEl          = document.getElementById("faviconLink");
+  const themeColorEl       = document.getElementById("themeColorMeta");
+  const BASE_TITLE         = (typeof document !== "undefined" && document.title) ? document.title : "Dictation";
   const autoGainEl       = document.getElementById("autoGain");
 
   const meterBar         = document.getElementById("meterBar");
@@ -1385,6 +1476,10 @@ right lower quadrant"></textarea>
   // on-screen overlay (foolproof when DevTools is filtered or unavailable). Off
   // by default; purely additive.
   var RT_DEBUG = (window.location.search.indexOf("debug=1") >= 0);
+  // [PERF] ?perf=1 also console.logs each take's stage breakdown; the ring is
+  // written either way, so a shift can be reviewed after the fact.
+  var PERF_DEBUG = (window.location.search.indexOf("perf=1") >= 0);
+  let takeTimings = null; // stage stamps for the take in flight (see resetTakeTimings)
   function rtDebugLog(line) {
     if (!RT_DEBUG) return;
     try { console.log(line); } catch (e) {}
@@ -1491,6 +1586,12 @@ right lower quadrant"></textarea>
   let analyserNode = null;
   let gateNode = null;
   let destNode = null;
+  // [ACCURACY] Look-ahead delay, in the RECORDED branch only. The analyser
+  // stays wired to the undelayed signal, so the gate decision, the flatline
+  // watchdog, the corpse probe, maxRmsSeen, the meter and the coverage guard's
+  // lastGateOpenAtMs baseline all keep their exact current meaning.
+  let lookaheadNode = null;
+  let stopTailTimer = null; // deferred mediaRecorder.stop() while the tail drains
   let gateTimer = null;
   let gateBuf = null;
   let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
@@ -1560,6 +1661,19 @@ right lower quadrant"></textarea>
   // then is free (nobody is speaking) and the next press lands on a live mic.
   const MIC_IDLE_PROBE_MS   = 4000; // sampling cadence while idle + visible
   const MIC_IDLE_DEAD_COUNT = 2;    // consecutive dead frames before rebuilding (one frame can race a teardown)
+  // [ACCURACY] Capture shaping around the load-bearing gate. The gate decides
+  // from the UNDELAYED analyser but gates audio that is GATE_LOOKAHEAD_MS
+  // behind it, so the ~70 ms of detection lag (30 ms tick + ~21 ms analysis
+  // window + 20 ms attack ramp) no longer eats the word onset — utterance-
+  // initial unvoiced consonants (f, s, h, p, t, th) sit below the 0.03 open
+  // threshold and were being attenuated in the audio that actually gets
+  // uploaded. RELEASE_TAIL_MS keeps capturing briefly past the PTT release so
+  // the last syllable is not truncated. Both are per-device sliders (0 = off);
+  // together they add their sum to the post-release latency, which is a
+  // deliberate trade: a clipped drug name costs a whole redictation.
+  const GATE_LOOKAHEAD_MS_DEFAULT = 120;
+  const RELEASE_TAIL_MS_DEFAULT   = 80;
+  const CAPTURE_TAIL_MAX_MS       = 1000; // hard bound on the deferred stop, whatever the sliders say
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -1625,6 +1739,13 @@ right lower quadrant"></textarea>
   // lever-by-lever. Additive, never wiped by a settings change. Bounded ring.
   const MICFAIL_LOG_KEY        = "scribe_v2_micfail_v9";
   const MICFAIL_LOG_MAX        = 10;
+  // [PERF] Per-device release-to-clipboard timing ring. Its own key (same
+  // precedent as the micfail ring): additive, never wiped by a settings change,
+  // bounded. Every finalized take lands one entry so the latency budget can be
+  // read off REAL shifts instead of estimated. Best-effort throughout — a
+  // storage failure must never touch the delivery path.
+  const TIMING_LOG_KEY         = "scribe_v2_timing_v9";
+  const TIMING_LOG_MAX         = 50;
 
   /* ───── Audio cues ─────
      Beeps prefer the persistent (already running) AudioContext: a fresh
@@ -2005,6 +2126,8 @@ right lower quadrant"></textarea>
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
     if (micGainValEl) micGainValEl.textContent = "(" + Number(micGainEl.value).toFixed(1) + "×)";
+    if (gateLookaheadValEl) gateLookaheadValEl.textContent = "(" + Number(gateLookaheadEl.value) + " ms)";
+    if (releaseTailValEl) releaseTailValEl.textContent = "(" + Number(releaseTailEl.value) + " ms)";
 
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
@@ -2111,6 +2234,11 @@ right lower quadrant"></textarea>
       highpass:       highpassEl.value,
       micGain:        micGainEl.value,
       autoGain:       autoGainEl.checked,
+      // Per-device (mic- and machine-specific capture shaping + a window cue
+      // for THIS screen): none of these belong in the portable settings set.
+      gateLookahead:  gateLookaheadEl ? gateLookaheadEl.value : String(GATE_LOOKAHEAD_MS_DEFAULT),
+      releaseTail:    releaseTailEl ? releaseTailEl.value : String(RELEASE_TAIL_MS_DEFAULT),
+      windowTint:     windowTintEl ? windowTintEl.value : "full",
       audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
       audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
@@ -2178,6 +2306,11 @@ right lower quadrant"></textarea>
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
       if (s.micGain   !== undefined) micGainEl.value   = s.micGain;
       if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
+      if (s.gateLookahead !== undefined && gateLookaheadEl) gateLookaheadEl.value = s.gateLookahead;
+      if (s.releaseTail   !== undefined && releaseTailEl)   releaseTailEl.value   = s.releaseTail;
+      if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
+        windowTintEl.value = s.windowTint;
+      }
       if (typeof s.audioSeedVersion === "number")  audioSeedVersion = s.audioSeedVersion;
       if (typeof s.audioUserTuned   === "boolean") audioUserTuned   = s.audioUserTuned;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
@@ -2679,12 +2812,30 @@ right lower quadrant"></textarea>
     const killer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs) : null;
 
     try {
+      stampTake("uploadStart"); // [PERF] bytes start moving here
       const res = await fetch("/api/transcribe", {
         method: "POST",
         body: form,
         signal: ctrl ? ctrl.signal : undefined,
       });
+      stampTake("headers"); // [PERF] response headers back = upload + service done
+      // Fold the Worker's own Server-Timing in: "el" is the ElevenLabs round
+      // trip, so (service - worker) is OUR network overhead — the only part any
+      // transport work could ever recover. Character classes only, no
+      // backslashes: this source lives inside a template literal.
+      try {
+        var stHeader = (res.headers && res.headers.get) ? res.headers.get("server-timing") : "";
+        if (stHeader && takeTimings) {
+          var mParse = /parse;dur=([0-9.]+)/.exec(stHeader);
+          var mEl    = /el;dur=([0-9.]+)/.exec(stHeader);
+          var mWk    = /worker;dur=([0-9.]+)/.exec(stHeader);
+          if (mParse) takeTimings.serverParseMs = Math.round(Number(mParse[1]));
+          if (mEl)    takeTimings.serverElMs    = Math.round(Number(mEl[1]));
+          if (mWk)    takeTimings.serverTotalMs = Math.round(Number(mWk[1]));
+        }
+      } catch (e) {}
       const raw = await res.text();
+      stampTake("body"); // [PERF] full response in hand
       let data;
       try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
 
@@ -2782,6 +2933,130 @@ right lower quadrant"></textarea>
   // mismatch, or the iOS voice-processing / session-silence wall) instead of a
   // generic message. Reads off the (possibly retained) graph; try/catch since
   // getSettings/label may be absent.
+  /* ───── [PERF] Per-take latency instrumentation ─────
+     Stage stamps for one dictation, from PTT release to the clipboard. The
+     point is to replace the ESTIMATED latency budget with measured numbers off
+     the real work machine and network, because the later (speculative) phases
+     of PERF_PLAN.md invert depending on how much of the wall clock is actually
+     ElevenLabs inference versus our own transport. Wholly additive: every
+     function here is try/caught and no-ops on failure, so instrumentation can
+     never affect a delivery. */
+  function perfNow() {
+    try {
+      if (typeof performance !== "undefined" && performance && performance.now) return performance.now();
+    } catch (e) {}
+    return Date.now();
+  }
+
+  function resetTakeTimings() {
+    takeTimings = {
+      start: perfNow(), release: 0, onstop: 0, uploadStart: 0,
+      headers: 0, body: 0, delivered: 0,
+      serverParseMs: null, serverElMs: null, serverTotalMs: null,
+      bytes: 0, chunks: 0, recMs: 0, keyterms: 0,
+      diarize: false, fileFormat: "", tailMs: 0,
+    };
+  }
+
+  // Stamp a stage once. First write wins: a retried/duplicated call (a second
+  // F14, a finalize reached by two paths) must not move a stage backwards.
+  function stampTake(key) {
+    try { if (takeTimings && !takeTimings[key]) takeTimings[key] = perfNow(); } catch (e) {}
+  }
+
+  function msBetween(a, b) {
+    return (a && b && b >= a) ? Math.round(b - a) : null;
+  }
+
+  // Fold the finished take into the ring + the Advanced readout. Called from
+  // the single delivery exit, so exactly one entry per take — success or loud
+  // failure alike (a failure's timings are the interesting ones).
+  function recordTakeTiming(outcome) {
+    try {
+      if (!takeTimings) return;
+      var t = takeTimings;
+      var entry = {
+        at:       new Date().toISOString(),
+        outcome:  outcome || "",
+        recMs:    Math.round(t.recMs || 0),
+        tailMs:   Math.round(t.tailMs || 0),
+        flush:    msBetween(t.release, t.onstop),
+        upload:   msBetween(t.onstop, t.uploadStart),
+        service:  msBetween(t.uploadStart, t.headers),
+        download: msBetween(t.headers, t.body),
+        deliver:  msBetween(t.body, t.delivered),
+        total:    msBetween(t.release, t.delivered),
+        elMs:     t.serverElMs,
+        parseMs:  t.serverParseMs,
+        workerMs: t.serverTotalMs,
+        kb:       Math.round((t.bytes || 0) / 1024),
+        chunks:   t.chunks || 0,
+        fmt:      t.fileFormat || "",
+        keyterms: t.keyterms || 0,
+        diarize:  Boolean(t.diarize),
+      };
+      // net = what the service round trip cost us MINUS what the Worker says it
+      // spent: our own network + Cloudflare overhead, the part transport work
+      // could ever address.
+      entry.net = (entry.service !== null && typeof entry.workerMs === "number")
+        ? Math.max(0, entry.service - entry.workerMs) : null;
+      try {
+        var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+        if (!Array.isArray(log)) log = [];
+        log.unshift(entry);
+        localStorage.setItem(TIMING_LOG_KEY, JSON.stringify(log.slice(0, TIMING_LOG_MAX)));
+      } catch (e) {}
+      renderTimingReadout(entry);
+      try {
+        if (PERF_DEBUG && typeof console !== "undefined" && console.log) console.log("[perf]", entry);
+      } catch (e) {}
+      takeTimings = null;
+    } catch (e) {}
+  }
+
+  function fmtMs(v) { return (v === null || v === undefined) ? "?" : (v + " ms"); }
+
+  function renderTimingReadout(entry) {
+    try {
+      if (!timingReadoutEl) return;
+      if (!entry) {
+        var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+        entry = (Array.isArray(log) && log.length) ? log[0] : null;
+      }
+      if (!entry) { timingReadoutEl.textContent = "No takes recorded yet."; return; }
+      timingReadoutEl.textContent =
+        "Last take: flush " + fmtMs(entry.flush) +
+        " · upload " + fmtMs(entry.upload) +
+        " · service " + fmtMs(entry.service) +
+        (typeof entry.elMs === "number" ? " (ElevenLabs " + entry.elMs + " ms, net " + fmtMs(entry.net) + ")" : "") +
+        " · deliver " + fmtMs(entry.deliver) +
+        " = " + fmtMs(entry.total) +
+        "  [" + (entry.recMs / 1000).toFixed(1) + "s take, " + entry.kb + " KB, " +
+        (entry.fmt || "?") + ", " + entry.keyterms + " keyterms" +
+        (entry.tailMs ? ", +" + entry.tailMs + " ms tail" : "") + "]";
+    } catch (e) {}
+  }
+
+  // TSV so a shift's worth pastes straight into a spreadsheet.
+  function timingLogTsv() {
+    var cols = ["at","outcome","total","flush","upload","service","net","elMs","parseMs","workerMs",
+                "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize"];
+    var out = [cols.join("\\t")];
+    try {
+      var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+      if (!Array.isArray(log)) log = [];
+      for (var i = 0; i < log.length; i++) {
+        var row = [];
+        for (var c = 0; c < cols.length; c++) {
+          var v = log[i][cols[c]];
+          row.push(v === null || v === undefined ? "" : String(v));
+        }
+        out.push(row.join("\\t"));
+      }
+    } catch (e) {}
+    return out.join("\\r\\n");
+  }
+
   function micDiag() {
     try {
       var track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
@@ -3033,10 +3308,37 @@ right lower quadrant"></textarea>
     micGainNode.connect(hpFilter);
     hpFilter.connect(analyserNode);
 
+    // [ACCURACY] Look-ahead delay, RECORDED BRANCH ONLY.
+    //
+    //   hpFilter -> analyserNode                          (undelayed: gate decision,
+    //                                                       watchdog, probe, meter)
+    //   hpFilter -> lookaheadNode -> gateNode -> destNode  (delayed: what is recorded)
+    //
+    // The gate still opens off the live analyser, but the audio it opens onto is
+    // GATE_LOOKAHEAD_MS older — so by the time the gain has ramped up, the samples
+    // passing through are the ones from BEFORE the threshold crossing. That is the
+    // recovered word onset. Nothing that reads the analyser changes meaning, which
+    // is what keeps every existing loud-failure guarantee intact.
+    //
+    // createDelay is feature-detected: without it we fall back to the exact
+    // previous wiring rather than losing the capture path.
+    lookaheadNode = null;
+    try {
+      if (audioCtx.createDelay) {
+        lookaheadNode = audioCtx.createDelay(CAPTURE_TAIL_MAX_MS / 1000);
+        lookaheadNode.delayTime.value = gateLookaheadMs() / 1000;
+      }
+    } catch (e) { lookaheadNode = null; }
+
     // BATCH CAPTURE: the post-gate audio is what MediaRecorder records and uploads.
     // The analyser above drives the capture waveform + dead-mic watchdog (read off
     // the same pre-gate signal).
-    hpFilter.connect(gateNode);
+    if (lookaheadNode) {
+      hpFilter.connect(lookaheadNode);
+      lookaheadNode.connect(gateNode);
+    } else {
+      hpFilter.connect(gateNode);
+    }
     gateNode.connect(destNode);
 
     gateBuf = new Float32Array(analyserNode.fftSize);
@@ -3150,7 +3452,7 @@ right lower quadrant"></textarea>
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
     stream = null; audioCtx = null; micGainNode = null; hpFilter = null; analyserNode = null;
-    gateNode = null; destNode = null; gateBuf = null; gateIsOpen = false;
+    gateNode = null; destNode = null; lookaheadNode = null; gateBuf = null; gateIsOpen = false;
     lastMeterPct = -1;
     meterBar.style.width = "0%";
     setGateStateUI(false);
@@ -3203,6 +3505,7 @@ right lower quadrant"></textarea>
     if (tailTimer)          { clearTimeout(tailTimer);          tailTimer = null; }
     if (finalDeadlineTimer) { clearTimeout(finalDeadlineTimer); finalDeadlineTimer = null; }
     if (quietTimer)         { clearTimeout(quietTimer);         quietTimer = null; }
+    if (stopTailTimer)      { clearTimeout(stopTailTimer);      stopTailTimer = null; }
   }
 
   async function startRecording() {
@@ -3325,6 +3628,13 @@ right lower quadrant"></textarea>
     lastWsError = "";
     recStartedAt = Date.now();
     recEndedAt = 0;
+    resetTakeTimings(); // [PERF] fresh stage stamps for this take
+    if (takeTimings) {
+      takeTimings.keyterms = (function () {
+        try { return JSON.parse(precomputedBatchKeyterms || "[]").length; } catch (e) { return 0; }
+      })();
+      takeTimings.diarize = diarizeActive();
+    }
     speechDetected = false;
     maxRmsSeen = 0;
     gateOpenMs = 0;
@@ -3425,11 +3735,32 @@ right lower quadrant"></textarea>
     }
   }
 
+  // Current look-ahead / tail settings, clamped. Sliders are per-device and 0
+  // disables either half independently.
+  function gateLookaheadMs() {
+    var v = gateLookaheadEl ? Number(gateLookaheadEl.value) : GATE_LOOKAHEAD_MS_DEFAULT;
+    if (!isFinite(v) || v < 0) v = 0;
+    return Math.min(CAPTURE_TAIL_MAX_MS, v);
+  }
+  function releaseTailMs() {
+    var v = releaseTailEl ? Number(releaseTailEl.value) : RELEASE_TAIL_MS_DEFAULT;
+    if (!isFinite(v) || v < 0) v = 0;
+    return Math.min(CAPTURE_TAIL_MAX_MS, v);
+  }
+  // How long to keep capturing past the release: the look-ahead delay line still
+  // holds that many milliseconds of audio (stopping now would DROP it), plus the
+  // deliberate tail so a fast release cannot truncate the final syllable.
+  function captureTailMs() {
+    var la = lookaheadNode ? gateLookaheadMs() : 0;
+    return Math.max(0, Math.min(CAPTURE_TAIL_MAX_MS, la + releaseTailMs()));
+  }
+
   function stopRecording() {
     if (!recording || stopping) {
       stopRequested = true;
       return;
     }
+    stampTake("release"); // [PERF] t0 of the release-to-clipboard budget
     userStopped = true;
     stopping = true;
     refreshLatestEditable(); // keep the box locked through the upload phase
@@ -3439,6 +3770,27 @@ right lower quadrant"></textarea>
     // and its onstop handler drives the finalize/upload.
     stopPhase = null;
     setStatus("Stopping — preparing upload…", "warn");
+
+    // [ACCURACY] Drain the look-ahead delay line and add the release tail before
+    // stopping the recorder. stopping=true and the status above are already set,
+    // so the UI shows the busy state immediately — the wait is not a visible
+    // hang. A second F14 during the window hits the stopping guard above and is
+    // a no-op; any unexpected failure still routes straight to finalizeSession
+    // and cancels this timer there.
+    var tail = captureTailMs();
+    if (takeTimings) takeTimings.tailMs = tail;
+    if (stopTailTimer) { clearTimeout(stopTailTimer); stopTailTimer = null; }
+    if (tail > 0) {
+      stopTailTimer = setTimeout(finishStopNow, tail);
+    } else {
+      finishStopNow();
+    }
+  }
+
+  // The actual recorder stop, reached either immediately or after the tail.
+  function finishStopNow() {
+    stopTailTimer = null;
+    if (sessionFinalized) return; // an unexpected failure already finalized this take
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
     } else {
@@ -3450,6 +3802,8 @@ right lower quadrant"></textarea>
     if (sessionFinalized) return;
     sessionFinalized = true;
     recEndedAt = Date.now(); // take length for the coverage guard + the duration-aware upload deadline
+    stampTake("onstop"); // [PERF] recorder flushed; the upload leg starts next
+    if (takeTimings) takeTimings.recMs = (recStartedAt ? Math.max(0, recEndedAt - recStartedAt) : 0);
     clearSessionTimers();
     showRecFeedback(false); // recording is over; the status line carries the upload state
 
@@ -3581,6 +3935,11 @@ right lower quadrant"></textarea>
     }
 
     const fileName = (blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
+    if (takeTimings) {
+      takeTimings.bytes = blob.size || 0;
+      takeTimings.chunks = chunks.length;
+      takeTimings.fileFormat = (blob.type || "").includes("ogg") ? "ogg" : "webm";
+    }
     setLinkPill("uploading");
     setStatus("Uploading audio for transcription…", "warn");
 
@@ -3698,6 +4057,8 @@ right lower quadrant"></textarea>
         setStatus("No speech detected — nothing transcribed; sentinel copied." + recordMicFailure("no-speech-quick-release"), "err");
       }
       failBeep();
+      stampTake("delivered");
+      recordTakeTiming("empty"); // [PERF] a failed take's timings are the interesting ones
       finishing = false;
       updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
       updateAppendChip();
@@ -3765,6 +4126,8 @@ right lower quadrant"></textarea>
       }
     }
 
+    stampTake("delivered");
+    recordTakeTiming(opts.degraded ? "degraded" : (opts.unexpected ? "unexpected" : "ok"));
     finishing = false;
     refreshLatestEditable(); // back to idle: the box is hand-editable again
     updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
@@ -4974,16 +5337,99 @@ right lower quadrant"></textarea>
   // the picture automatically: a zero-listener ack or relay failure lands as
   // an "err" status after the local delivery, turning the screen red even
   // though the local done beep already played.
+  // The single source of truth for "what is this app doing right now", derived
+  // from the status class and the mic/link pills that every path already sets.
+  // Both the phone big screen and the desktop window-wide cue read it, so
+  // neither invents state of its own (CLAUDE.md: the screen state is DERIVED).
+  function currentUiState() {
+    if (lastMicPillState === "fail") return "alarm";
+    if (recording && !stopping) return lastLinkPillState === "connecting" ? "connecting" : "rec";
+    if (stopping || finishing || lastLinkPillState === "uploading" || lastLinkPillState === "refining") return "busy";
+    if (lastStatusCls === "err") return "fail";
+    if (lastStatusCls === "warn") return "warn";
+    if (lastStatusCls === "ok") return "ok";
+    return "idle";
+  }
+
+  // [UI] Window-wide recording cue. The app is used in a PWA window shrunk to a
+  // sliver beside Cerner, on machines with no speakers, so the in-card pill and
+  // waveform are invisible exactly when they matter. This paints the WHOLE
+  // window by state (readable from any visible edge, no text to read, no sound
+  // needed) and mirrors the state into the tab title, the favicon, and — best
+  // effort, feature-detected — the app badge and theme colour.
+  //
+  // Purely presentational and additive: no new state, driven off
+  // currentUiState(), and suppressed under body.bigbtn where the phone overlay
+  // already owns the screen.
+  let lastWindowState = "";
+  function applyWindowState() {
+    try {
+      var st = currentUiState();
+      if (st === lastWindowState) return;
+      lastWindowState = st;
+      if (document.body) document.body.setAttribute("data-state", st);
+      document.title =
+        st === "rec"   ? "\u25CF REC \u2014 Dictation" :
+        st === "busy"  ? "\u2026 Working \u2014 Dictation" :
+        (st === "fail" || st === "alarm") ? "\u26A0 FAILED \u2014 Dictation" :
+        st === "warn"  ? "\u26A0 Check \u2014 Dictation" :
+        st === "ok"    ? "\u2713 Done \u2014 Dictation" : BASE_TITLE;
+      setStateFavicon(st);
+      // App badge: installed-PWA taskbar/dock dot. "Limited availability" per
+      // MDN and unverified on every target, so it is a bonus on top of the
+      // wash, never the only cue.
+      try {
+        if (navigator.setAppBadge && navigator.clearAppBadge) {
+          if (st === "rec") navigator.setAppBadge(1); else navigator.clearAppBadge();
+        }
+      } catch (e) {}
+      // Some desktop PWA title bars follow theme-color. Also unverified — same
+      // status as the badge.
+      try {
+        if (themeColorEl) {
+          themeColorEl.setAttribute("content",
+            st === "rec" ? "#7f1d1d" :
+            st === "busy" ? "#78350f" :
+            (st === "fail" || st === "alarm") ? "#7f1d1d" : "#0b0d10");
+        }
+      } catch (e) {}
+    } catch (e) {}
+  }
+
+  // A flat colour disc as an inline SVG data URI — no network fetch, no extra
+  // route, and legible at 16px in a tab strip or taskbar.
+  // The tint mode is a body class so the CSS above can select on it; changing
+  // it re-stamps the state attribute so the new mode paints immediately.
+  function applyWindowTintMode() {
+    try {
+      var mode = windowTintEl ? windowTintEl.value : "full";
+      if (!document.body) return;
+      document.body.classList.toggle("tint-full", mode === "full");
+      document.body.classList.toggle("tint-border", mode === "border");
+      lastWindowState = ""; // force the next applyWindowState to repaint
+      applyWindowState();
+    } catch (e) {}
+  }
+
+  function setStateFavicon(st) {
+    try {
+      if (!faviconEl) return;
+      var color =
+        st === "rec" ? "%23dc2626" :
+        st === "busy" ? "%23f59e0b" :
+        (st === "fail" || st === "alarm") ? "%23dc2626" :
+        st === "ok" ? "%2322c55e" : "";
+      if (!color) { faviconEl.setAttribute("href", "/icon-192.png"); return; }
+      faviconEl.setAttribute("href",
+        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E" +
+        "%3Ccircle cx='16' cy='16' r='13' fill='" + color + "'/%3E%3C/svg%3E");
+    } catch (e) {}
+  }
+
   function updateBigScreen() {
+    applyWindowState(); // desktop window cue — must run even without the overlay
     if (!bigUiEl) return;
-    let state;
-    if (lastMicPillState === "fail") state = "alarm";
-    else if (recording && !stopping) state = lastLinkPillState === "connecting" ? "connecting" : "rec";
-    else if (stopping || finishing || lastLinkPillState === "uploading" || lastLinkPillState === "refining") state = "busy";
-    else if (lastStatusCls === "err") state = "fail";
-    else if (lastStatusCls === "warn") state = "warn";
-    else if (lastStatusCls === "ok") state = "ok";
-    else state = "idle";
+    const state = currentUiState();
     bigUiEl.setAttribute("data-screen", state);
     if (bigStateEl) {
       // The warn headline must never claim DONE: warn covers both degraded
@@ -5421,6 +5867,32 @@ right lower quadrant"></textarea>
     releaseAudio();
     tryWarmOnLoad();
   });
+  // Look-ahead retunes the live DelayNode — no graph rebuild, so it can be
+  // adjusted between takes (or mid-take) without dropping the mic.
+  if (gateLookaheadEl) gateLookaheadEl.addEventListener("input", () => {
+    if (lookaheadNode) {
+      try { lookaheadNode.delayTime.value = gateLookaheadMs() / 1000; } catch (e) {}
+    }
+    updateGateLabels();
+    saveSettings();
+  });
+  if (releaseTailEl) releaseTailEl.addEventListener("input", () => {
+    updateGateLabels();
+    saveSettings();
+  });
+  if (windowTintEl) windowTintEl.addEventListener("change", () => {
+    applyWindowTintMode();
+    saveSettings();
+  });
+  if (copyTimingBtn) copyTimingBtn.addEventListener("click", async () => {
+    var ok = await copyText(timingLogTsv());
+    setStatus(ok ? "Timing log copied (TSV)." : "Could not copy the timing log — click the page, then retry.", ok ? "ok" : "err");
+  });
+  if (clearTimingBtn) clearTimingBtn.addEventListener("click", () => {
+    try { localStorage.removeItem(TIMING_LOG_KEY); } catch (e) {}
+    renderTimingReadout(null);
+    setStatus("Timing log cleared.", "ok");
+  });
 
   // Dynamic Scribe event listeners
 
@@ -5495,11 +5967,25 @@ right lower quadrant"></textarea>
     }
     if (e.code === "F14") {
       e.preventDefault();
-      if (recording || stopRequested) stopRecording();
-      // CapsLock released while a queued start was armed (or still pending a
-      // finalize): a session starting AFTER the last F14 would violate the
-      // contract — and open a mic nobody is holding.
-      else cancelQueuedStart();
+      // "Already ending" = the take is winding down but has not finalized yet:
+      // the capture tail (recording is STILL true while the look-ahead delay
+      // line drains) or the finalize/upload. The pointer and hotkey release
+      // paths already special-case this; F14 must too, because during the tail
+      // "recording" is true and the old (recording || stopRequested) test sent
+      // this branch to stopRecording() — which only re-latches stopRequested and
+      // NEVER reached cancelQueuedStart(), so a start queued by an F13 during
+      // the tail would begin after the last F14 and open a mic nobody is
+      // holding. That is the F13/F14 contract, so it is checked FIRST.
+      const alreadyEnding = stopping || finishing;
+      if (recording && !alreadyEnding) {
+        stopRecording();                 // the live capture ends here
+      } else if (stopRequested && !alreadyEnding) {
+        stopRecording();                 // latch: F14 beat the recorder's start
+      } else {
+        // Idle, or the press that queued a start just ended: a session starting
+        // AFTER the last F14 would violate the contract.
+        cancelQueuedStart();
+      }
       return;
     }
 
@@ -5611,6 +6097,8 @@ right lower quadrant"></textarea>
   loadSettings();
   seedIosAudioDefaults(); // after loadSettings (respect a hand-tuned device), before updateGateLabels/tryWarmOnLoad so the seeded gain+gate are reflected and built
   applyEngineUI();
+  applyWindowTintMode();   // window-wide recording cue: paint the persisted mode at boot
+  renderTimingReadout(null); // show the most recent stored take, if any
   updateGateLabels();
   updateKeytermHint();
   updateHotkeyUI();
