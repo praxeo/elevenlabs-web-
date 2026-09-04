@@ -164,21 +164,39 @@ MockWS.CONNECTING = 0; MockWS.OPEN = 1; MockWS.CLOSING = 2; MockWS.CLOSED = 3;
 
 let micRms = 0.05; // pretend speech level; the gate-meter watchdog reads it
 
+// Audio-graph wiring capture. Nodes are tagged and record what they connect
+// to, so scenario 45 can prove the look-ahead delay sits in the RECORDED branch
+// only and the analyser stays on the undelayed signal (the property every
+// existing loud-failure guarantee depends on).
+const audioWiring = { biquads: [], analysers: [], delays: [], gains: [] };
+function resetAudioWiring() { audioWiring.biquads = []; audioWiring.analysers = []; audioWiring.delays = []; audioWiring.gains = []; }
+
 class MockAudioCtx {
   constructor() { this.state = 'running'; this.currentTime = 0; this.sampleRate = 48000; this.destination = {}; }
   resume() { return Promise.resolve(); }
   close() { return Promise.resolve(); }
-  createMediaStreamSource() { return { connect() {} }; }
-  createBiquadFilter() { return { type: '', frequency: { value: 0 }, Q: { value: 0 }, connect() {} }; }
+  createMediaStreamSource() { const n = { _kind: 'source', out: [], connect(t) { n.out.push(t); } }; return n; }
+  createBiquadFilter() {
+    const n = { _kind: 'biquad', type: '', frequency: { value: 0 }, Q: { value: 0 }, out: [], connect(t) { n.out.push(t); } };
+    audioWiring.biquads.push(n); return n;
+  }
   createAnalyser() {
-    return {
-      fftSize: 1024,
-      connect() {},
+    const n = {
+      _kind: 'analyser', fftSize: 1024, out: [],
+      connect(t) { n.out.push(t); },
       getFloatTimeDomainData(buf) { buf.fill(micRms); },
     };
+    audioWiring.analysers.push(n); return n;
   }
-  createGain() { return { gain: { value: 0, setTargetAtTime() {} }, connect() {} }; }
-  createMediaStreamDestination() { return { stream: { tag: 'dest' }, connect() {} }; }
+  createDelay(max) {
+    const n = { _kind: 'delay', maxDelay: max, delayTime: { value: 0 }, out: [], connect(t) { n.out.push(t); } };
+    audioWiring.delays.push(n); return n;
+  }
+  createGain() {
+    const n = { _kind: 'gain', gain: { value: 0, setTargetAtTime() {} }, out: [], connect(t) { n.out.push(t); } };
+    audioWiring.gains.push(n); return n;
+  }
+  createMediaStreamDestination() { return { _kind: 'dest', stream: { tag: 'dest' }, connect() {} }; }
   createOscillator() { return { frequency: { value: 0 }, connect() {}, start() {}, stop() {} }; }
 }
 
@@ -228,6 +246,9 @@ const dom = new JSDOM(html, {
           resolve({
             ok: next.status >= 200 && next.status < 300,
             status: next.status,
+            // Server-Timing carries the Worker's own stage split; the client
+            // folds it into the timing ring (scenario 43).
+            headers: { get: (k) => (next.headers ? (next.headers[String(k).toLowerCase()] || null) : null) },
             text: () => Promise.resolve(JSON.stringify(next.body)),
           });
         }, next.delayMs || 5);
@@ -480,8 +501,11 @@ doc.getElementById('freshBtn').click();
 fetchQueue.push({ delayMs: 800, status: 200, body: { text: 'Slow upload note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
-doc.getElementById('recordBtn').click(); // stop -> slow upload starts
-await sleep(120);
+doc.getElementById('recordBtn').click(); // stop -> capture tail drains, then the slow upload starts
+// Wait past the capture tail (gate look-ahead 120 ms + release tail 80 ms, s45)
+// before asserting the upload is in flight: the recorder is deliberately still
+// running during that window so the delay line is not thrown away.
+await sleep(340);
 doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' })); // PTT during upload
 check('still uploading when PTT queued', doc.getElementById('linkPill').textContent === 'uploading…', doc.getElementById('linkPill').textContent);
 await sleep(1100); // upload resolves, queued session starts (~60ms later)
@@ -1999,11 +2023,15 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(450);
   pev(B.win, bigBtnB, 'pointerup', 14); // slow upload (finishing)
   await sleep(100);
+  // NOTE: at this point the release is only 100 ms old, so the take is still in
+  // its CAPTURE TAIL (recording is true, stopping is true — see s45). F14 must
+  // still cancel the queued start there: a session starting after the last F14
+  // would open a mic nobody is holding.
   dB.dispatchEvent(new B.win.KeyboardEvent('keydown', { code: 'F13' })); // queue
   dB.dispatchEvent(new B.win.KeyboardEvent('keydown', { code: 'F14' })); // CapsLock released
   B.batchDelayMs = 0;
-  await sleep(600);
-  check('s25b: F14 cancels a queued start', dB.getElementById('recordBtn').textContent.includes('Start'));
+  await sleep(900);
+  check('s25b: F14 cancels a queued start (even during the capture tail)', dB.getElementById('recordBtn').textContent.includes('Start'));
   check('s25b: F14-cancelled flow still delivered the note', (B.win._clip || '').includes('F14 note.'), JSON.stringify(B.win._clip));
 
   // hold-through-delivery ghost: press queued during a finalize, the delivery
@@ -2571,8 +2599,8 @@ console.log('--- scenario 29: batch-only product ---');
   await sleep(140); // let the gate-meter loop tick and reveal the capture feedback
   check('s29: recording shows the live capture feedback (waveform + timer)', doc29.getElementById('recFeedback').style.display !== 'none');
   check('s29: no realtime WebSocket opens in batch mode', !socks29.some((s) => s.url.includes('/api/transcribe')));
-  doc29.getElementById('recordBtn').click(); // stop -> upload -> deliver
-  await sleep(140);
+  doc29.getElementById('recordBtn').click(); // stop -> capture tail -> upload -> deliver
+  await sleep(420); // past the capture tail (look-ahead 120 + release tail 80, s45)
   check('s29: capture feedback hides once recording ends', doc29.getElementById('recFeedback').style.display === 'none');
   check('s29: batch text reaches the clipboard', (w29._clip || '').includes('Batch note'), w29._clip);
   // The saved Hybrid engine migrated to Batch: the history entry is tagged batch
@@ -3829,6 +3857,297 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   chip42.click();
   await sleep(300);
   check('s42c-c: after auth heals, the queued note delivers and the chip clears', chip42.style.display === 'none', chip42.style.display);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 43. [PERF] Per-take latency instrumentation: every finalized take lands one
+//     entry in the timing ring (success AND loud failure), the Worker's
+//     Server-Timing split is folded in, the ring is bounded, and the Advanced
+//     readout reflects the newest take.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 43: per-take timing instrumentation ---');
+  const fetch43 = [];
+  let body43 = { status: 200, body: { text: 'Timed note.' } };
+  let w43;
+  const dom43 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w43 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = (url, opts) => {
+        fetch43.push({ url: String(url), opts });
+        return new Promise((r) => setTimeout(() => r({
+          ok: body43.status < 300, status: body43.status,
+          headers: { get: (k) => (String(k).toLowerCase() === 'server-timing' ? 'parse;dur=12, el;dur=640, worker;dur=655' : null) },
+          text: () => Promise.resolve(JSON.stringify(body43.body)),
+        }), 30));
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-43');
+    },
+  });
+  await sleep(150);
+  const doc43 = dom43.window.document;
+  const ring43 = () => { try { return JSON.parse(w43.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+
+  check('s43: the timing ring starts empty', ring43().length === 0, ring43().length);
+  check('s43: Advanced exposes the readout + copy/clear controls',
+    !!doc43.getElementById('timingReadout') && !!doc43.getElementById('copyTimingBtn') && !!doc43.getElementById('clearTimingBtn'));
+
+  micRms = 0.05;
+  doc43.getElementById('recordBtn').click();
+  await sleep(140);
+  doc43.getElementById('recordBtn').click();
+  await sleep(700);
+
+  const log43 = ring43();
+  check('s43: a finished take records exactly one entry', log43.length === 1, log43.length);
+  const e43 = log43[0] || {};
+  check('s43: the outcome is recorded as ok', e43.outcome === 'ok', e43.outcome);
+  check('s43: release->clipboard total is measured', typeof e43.total === 'number' && e43.total >= 0, e43.total);
+  check('s43: the service leg is measured', typeof e43.service === 'number' && e43.service > 0, e43.service);
+  check('s43: the Worker Server-Timing split is folded in (el/parse/worker)',
+    e43.elMs === 640 && e43.parseMs === 12 && e43.workerMs === 655, JSON.stringify([e43.elMs, e43.parseMs, e43.workerMs]));
+  check('s43: net = service minus the Worker-reported time (our own network cost)',
+    e43.net === Math.max(0, e43.service - 655), JSON.stringify([e43.net, e43.service]));
+  check('s43: the upload size and take length ride along', e43.kb > 0 && e43.recMs > 0, JSON.stringify([e43.kb, e43.recMs]));
+  check('s43: the tail added by the look-ahead is recorded', typeof e43.tailMs === 'number' && e43.tailMs > 0, e43.tailMs);
+  check('s43: the readout shows the newest take',
+    (doc43.getElementById('timingReadout').textContent || '').includes('Last take:'),
+    doc43.getElementById('timingReadout').textContent);
+
+  // A LOUD FAILURE must be measured too — those timings are the interesting ones.
+  body43 = { status: 500, body: { error: 'service exploded' } };
+  doc43.getElementById('recordBtn').click();
+  await sleep(140);
+  doc43.getElementById('recordBtn').click();
+  await sleep(900);
+  const log43b = ring43();
+  check('s43: a FAILED take is also recorded', log43b.length === 2, log43b.length);
+  check('s43: the failed take is tagged as a failure outcome',
+    log43b[0].outcome === 'empty' || log43b[0].outcome === 'unexpected', log43b[0].outcome);
+
+  // Bounded ring: seed past the cap, take once, confirm it is trimmed.
+  const seed = [];
+  for (let i = 0; i < 70; i++) seed.push({ at: 'x' + i, outcome: 'ok', total: i });
+  w43.localStorage.setItem('scribe_v2_timing_v9', JSON.stringify(seed));
+  body43 = { status: 200, body: { text: 'Capped note.' } };
+  doc43.getElementById('recordBtn').click();
+  await sleep(140);
+  doc43.getElementById('recordBtn').click();
+  await sleep(700);
+  check('s43: the ring is bounded to TIMING_LOG_MAX (50)', ring43().length === 50, ring43().length);
+
+  doc43.getElementById('clearTimingBtn').click();
+  await sleep(20);
+  check('s43: clearing empties the ring', ring43().length === 0, ring43().length);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44. [UI] Window-wide recording cue: body[data-state] mirrors the SAME derived
+//     state the big screen uses, the title/favicon follow, the per-device tint
+//     mode persists, and the CSS never applies the wash under the phone overlay.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 44: window-wide recording cue ---');
+  let w44;
+  const dom44 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w44 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = () => Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        text: () => Promise.resolve(JSON.stringify({ text: 'Cue note.' })),
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-44');
+    },
+  });
+  await sleep(150);
+  const doc44 = dom44.window.document;
+  const body44 = doc44.body;
+  const baseTitle = doc44.title;
+
+  check('s44: the state edge overlay exists', !!doc44.getElementById('stateEdge'));
+  check('s44: the tint mode defaults to the full-window wash', body44.classList.contains('tint-full'), body44.className);
+  check('s44: idle is the resting state', body44.getAttribute('data-state') === 'idle', body44.getAttribute('data-state'));
+
+  micRms = 0.05;
+  doc44.getElementById('recordBtn').click();
+  await sleep(140);
+  check('s44: recording paints the window red', body44.getAttribute('data-state') === 'rec', body44.getAttribute('data-state'));
+  check('s44: the tab title announces REC', doc44.title.includes('REC'), doc44.title);
+  check('s44: the favicon swaps to a state disc',
+    (doc44.getElementById('faviconLink').getAttribute('href') || '').startsWith('data:image/svg+xml'),
+    doc44.getElementById('faviconLink').getAttribute('href'));
+
+  doc44.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s44: a delivered take lands on the ok state', body44.getAttribute('data-state') === 'ok', body44.getAttribute('data-state'));
+  check('s44: the title returns to a non-REC state', !doc44.title.includes('REC'), doc44.title);
+
+  // Per-device mode switch: "off" drops both wash classes and persists.
+  const tint44 = doc44.getElementById('windowTint');
+  tint44.value = 'off';
+  tint44.dispatchEvent(new dom44.window.Event('change'));
+  await sleep(320);
+  check('s44: turning the cue off removes both wash classes',
+    !body44.classList.contains('tint-full') && !body44.classList.contains('tint-border'), body44.className);
+  const saved44 = JSON.parse(w44.localStorage.getItem('scribe_v2_settings_v9') || '{}');
+  check('s44: the tint mode persists per device', saved44.windowTint === 'off', saved44.windowTint);
+
+  tint44.value = 'border';
+  tint44.dispatchEvent(new dom44.window.Event('change'));
+  await sleep(320);
+  check('s44: border mode applies its own class', body44.classList.contains('tint-border'), body44.className);
+
+  // The phone overlay owns its own screen state — the wash must never apply there.
+  check('s44: the CSS excludes the wash under body.bigbtn',
+    html.includes('body.tint-full[data-state="rec"]:not(.bigbtn)') &&
+    html.includes('body.tint-border[data-state="rec"]:not(.bigbtn)'));
+  check('s44: base title is restorable (kept for the idle state)', typeof baseTitle === 'string' && baseTitle.length > 0, baseTitle);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 45. [ACCURACY] Gate look-ahead + release tail. The delay sits in the RECORDED
+//     branch only (the analyser stays undelayed, so the watchdog/probe/meter and
+//     the coverage baseline are untouched), the recorder stop is DEFERRED by the
+//     tail so the delay line drains, the recorder still stops exactly once, and
+//     setting both sliders to 0 restores the immediate stop.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 45: gate look-ahead + release tail ---');
+  resetAudioWiring();
+  let w45;
+  let recorder45 = null;
+  let stopCount45 = 0;
+  const mkDom45 = (settings) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w45 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; recorder45 = this; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          stopCount45++;
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = () => Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        text: () => Promise.resolve(JSON.stringify({ text: 'Tail note.' })),
+      });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(Object.assign({ saveApiKey: true, micGranted: true }, settings)));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-45');
+    },
+  });
+
+  const dom45 = mkDom45({});
+  await sleep(150);
+  const doc45 = dom45.window.document;
+
+  check('s45: the look-ahead slider defaults to 120 ms', doc45.getElementById('gateLookahead').value === '120', doc45.getElementById('gateLookahead').value);
+  check('s45: the release tail slider defaults to 80 ms', doc45.getElementById('releaseTail').value === '80', doc45.getElementById('releaseTail').value);
+
+  micRms = 0.05;
+  doc45.getElementById('recordBtn').click();
+  await sleep(150);
+
+  const delay45 = audioWiring.delays[audioWiring.delays.length - 1];
+  check('s45: a DelayNode is created for the look-ahead', !!delay45);
+  check('s45: the delay is set from the slider (120 ms => 0.12 s)',
+    delay45 && Math.abs(delay45.delayTime.value - 0.12) < 1e-6, delay45 && delay45.delayTime.value);
+
+  // Wiring: hpFilter feeds BOTH the analyser (undelayed) and the delay (recorded).
+  const hp45 = audioWiring.biquads[audioWiring.biquads.length - 1];
+  const feedsAnalyser = !!(hp45 && hp45.out.some((n) => n && n._kind === 'analyser'));
+  const feedsDelay = !!(hp45 && hp45.out.some((n) => n && n._kind === 'delay'));
+  check('s45: the high-pass feeds the analyser directly (UNDELAYED)', feedsAnalyser);
+  check('s45: the high-pass also feeds the look-ahead delay (recorded branch)', feedsDelay);
+  check('s45: the high-pass does NOT feed the gate directly any more (the delay is in between)',
+    hp45 && !hp45.out.some((n) => n && n._kind === 'gain'), hp45 && hp45.out.map((n) => n && n._kind).join(','));
+  check('s45: the delay feeds the gate gain (delay -> gate -> destination)',
+    delay45 && delay45.out.some((n) => n && n._kind === 'gain'), delay45 && delay45.out.map((n) => n && n._kind).join(','));
+  const analyser45 = audioWiring.analysers[audioWiring.analysers.length - 1];
+  check('s45: the analyser is a read-only leaf (nothing downstream can delay it)',
+    analyser45 && analyser45.out.length === 0, analyser45 && analyser45.out.length);
+
+  // The stop must be DEFERRED by look-ahead + tail (120 + 80 = 200 ms).
+  stopCount45 = 0;
+  doc45.getElementById('recordBtn').click(); // release
+  await sleep(60);
+  check('s45: the recorder is still capturing 60 ms after release (tail draining)',
+    recorder45 && recorder45.state === 'recording', recorder45 && recorder45.state);
+  check('s45: the status already shows the busy state during the tail',
+    doc45.getElementById('status').textContent.includes('Stopping'), doc45.getElementById('status').textContent);
+  await sleep(400);
+  check('s45: the recorder has stopped once the tail elapsed',
+    recorder45 && recorder45.state === 'inactive', recorder45 && recorder45.state);
+  check('s45: the recorder was stopped EXACTLY once (no double-stop)', stopCount45 === 1, stopCount45);
+  await sleep(400);
+  check('s45: the take still delivers normally after the tail',
+    (w45._clip || '').includes('Tail note'), w45._clip);
+
+  // Zero sliders => the previous immediate-stop behaviour, unchanged.
+  const dom45b = mkDom45({ gateLookahead: '0', releaseTail: '0' });
+  await sleep(150);
+  const doc45b = dom45b.window.document;
+  stopCount45 = 0;
+  micRms = 0.05;
+  doc45b.getElementById('recordBtn').click();
+  await sleep(150);
+  doc45b.getElementById('recordBtn').click();
+  await sleep(30);
+  check('s45: with both sliders at 0 the recorder stops immediately (no deferral)',
+    recorder45 && recorder45.state === 'inactive', recorder45 && recorder45.state);
+  check('s45: still exactly one stop with the tail disabled', stopCount45 === 1, stopCount45);
+  await sleep(600);
+  check('s45: the zero-tail take delivers too', (w45._clip || '').includes('Tail note'), w45._clip);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
