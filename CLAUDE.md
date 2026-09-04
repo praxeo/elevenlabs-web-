@@ -32,6 +32,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 - `hotkey.ahk` — AutoHotkey v2 push-to-talk relay (CapsLock → F13/F14, clipboard handoff) + optional phone-link clipboard poller (`GET /latest`, focus-free native clipboard writes; set `PHONE_AUTH` to the access code against a shared-mode worker — the session routes answer 401 without it).
 - `wrangler.toml` (deploys as worker `eleven`), `README.md`, this file.
 - `REALTIME_HANDOFF.md` — **archive** of the realtime-engine investigation (root causes, what was ruled out, the engine evolution) + how to resurrect it (the owner hasn't given up on realtime). **Do not delete.** `LATENCY_PLAN.md` — **archived**: the realtime/hybrid finalize-latency plan, obsolete for the batch-only product but kept for the resurrection path.
+- `PERF_PLAN.md` — **active plan** for batch latency, mic accuracy, and the minimized-window recording cue: the measured latency budget, the ranked accuracy hypotheses, and the phased work (instrument first, then the certain wins, then the conditional transport work). Supersedes the archived `LATENCY_PLAN.md` for the batch product.
 
 ## Constraints & style
 
